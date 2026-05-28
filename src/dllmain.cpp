@@ -12,7 +12,7 @@ bool InitializeSteamComponents()
     sprintf_s(SteamclientPath, MAX_PATH, "%s\\steamclient64.dll",  SteamInstallPath);
     sprintf_s(SteamUIPath,     MAX_PATH, "%s\\steamui.dll",        SteamInstallPath);
     sprintf_s(DiversionPath,   MAX_PATH, "%s\\bin\\diversion.dll", SteamInstallPath);
-    sprintf_s(LuaDir,          MAX_PATH, "%s\\config\\lua",        SteamInstallPath);
+    sprintf_s(LuaDir,          MAX_PATH, "%s\\config\\stplug-in",        SteamInstallPath);
     sprintf_s(ConfigPath,      MAX_PATH, "%s\\opensteamtool.toml", SteamInstallPath);
     
     client_hModule = LoadLibraryA(SteamclientPath);

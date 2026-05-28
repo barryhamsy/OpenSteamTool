@@ -31,13 +31,4 @@ namespace PatternLoader {
     // locate.  Call this once after all hooks are installed.
     void ReportMissingFunctions();
 
-    // True if AT LEAST ONE Load() call succeeded via remote (GitHub/jsDelivr
-    // /custom mirror) this session.  False means every Load() fell back to
-    // the local cache — i.e. the machine had no usable network at DLL init.
-    //
-    // Other hooks (e.g. Hooks_Misc::GetOrAddAppData) use this as the offline
-    // signal: "online enough to fetch our patterns" ≈ "online enough for PICS
-    // to respond".  Snapshotted at init, not re-evaluated mid-session.
-    bool WasRemoteReachable();
-
 } // namespace PatternLoader

@@ -1,6 +1,5 @@
 #include "Hooks_Misc.h"
 #include "HookMacros.h"
-#include "Utils/PatternLoader.h"
 #include "Utils/VehCommon.h"
 #include "dllmain.h"
 
@@ -17,18 +16,6 @@ namespace {
     // is detected; cleared when a non-onlinefix game launches.
     AppId_t   g_OnlineFixRealAppId;
     std::unordered_map<AppId_t, std::string> g_GameNameCache;
-
-    // ── Offline gate for GetOrAddAppData ──────────────────────────
-    // Snapshotted at Install() from PatternLoader::WasRemoteReachable().
-    // True = at least one PatternLoader fetch hit the network → treat
-    // session as online → GetOrAddAppData does nothing (PICS will resolve
-    // newly added depots naturally).
-    // False = all pattern fetches fell back to cache → treat session as
-    // offline → GetOrAddAppData applies skip_flag so license updates
-    // complete without waiting for PICS responses that will never arrive.
-    // Snapshotted, never re-evaluated — if connectivity changes mid-
-    // session, relaunch Steam.
-    bool g_IsOffline = false;
 
 
     // ── SpawnProcess interception ────────────────────────────────────────────
@@ -88,21 +75,21 @@ namespace {
     }
 
     // CAppInfoCache::GetOrAddAppData
-    //
-    // GATED ON OFFLINE STATE (g_IsOffline). See block above for rationale.
-    // Online: do nothing — let PICS resolve placeholder appinfo for newly
-    //         added depots naturally. Otherwise we'd condemn brand-new
-    //         AppIDs to "known-unknown" before PICS had a chance, and
-    //         new-game unlocks would silently fail online.
-    // Offline: apply skip_flag exactly as upstream did, so
-    //          ProcessPendingLicenseUpdates completes without waiting for
-    //          PICS responses that will never arrive.
+    // The injected package keeps Lua-provided ids in PackageInfo::AppIdVec.
+    // Some of those ids can actually be depot ids, but we cannot trust the
+    // Lua config to classify app ids and depot ids for us. In offline mode,
+    // depot ids usually have only placeholder appinfo data. That blocks
+    // CClientAppManager_ProcessPendingLicenseUpdates, because it waits for
+    // every AppIdVec entry to have resolved appinfo unless the entry has been
+    // marked as a known-unknown id by the PICS path. For injected ids that
+    // still have placeholder appinfo, set skip_flag so Steam treats them like
+    // PICS unknown_appids instead of keeping the license update pending.
     HOOK_FUNC(GetOrAddAppData,CAppData*,void* pCache, AppId_t appId,bool bCreate)
     {
         CAppData* pData = oGetOrAddAppData(pCache, appId, bCreate);
-        if (!g_IsOffline) return pData;  // online: hook is a passthrough
+        // LOG_MISC_TRACE("GetOrAddAppData: appId={} bCreate={} -> pData={}", appId, bCreate, pData ? pData->DebugString() : "null");
         if (LuaConfig::HasDepot(appId, false) && pData && !bCreate && pData->IsUnresolvedAppInfo()) {
-            LOG_MISC_DEBUG("GetOrAddAppData (offline): Marking appId {} as skip_flag=true to bypass license update blocking", appId);
+            LOG_MISC_DEBUG("GetOrAddAppData: Marking appId {} as skip_flag=true to bypass license update blocking", appId);
             pData->bSkipFlag = true;
         }
         return pData;
@@ -118,17 +105,10 @@ namespace Hooks_Misc {
 
         ARM_INT3_C(SpawnProcess, true, &OnSpawnProcessHit, nullptr);
 
-        // Snapshot offline state from PatternLoader's actual fetch result.
-        // PatternLoader::Load() must have completed for both DLLs before
-        // Hooks_Misc::Install() runs (it does — see dllmain init order).
-        g_IsOffline = !PatternLoader::WasRemoteReachable();
-        LOG_MISC_INFO("Hooks_Misc: offline mode = {} (GetOrAddAppData skip_flag {})",
-                      g_IsOffline, g_IsOffline ? "ACTIVE" : "passthrough");
-
         HOOK_BEGIN();
         INSTALL_HOOK_C(BuildSpawnEnvBlock);
         INSTALL_HOOK_C(OptedInMask);
-        INSTALL_HOOK_C(GetOrAddAppData);
+        //INSTALL_HOOK_C(GetOrAddAppData);
         HOOK_END();
     }
 
@@ -136,7 +116,7 @@ namespace Hooks_Misc {
         UNHOOK_BEGIN();
         UNINSTALL_HOOK(BuildSpawnEnvBlock);
         UNINSTALL_HOOK(OptedInMask);
-        UNINSTALL_HOOK(GetOrAddAppData);
+        //UNINSTALL_HOOK(GetOrAddAppData);
         UNHOOK_END();
     }
 

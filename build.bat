@@ -6,17 +6,12 @@ cd /d "%~dp0"
 
 REM ---------------------------------------------------------------------------
 REM Configurable build options
-REM   GENERATOR  - CMake generator (default: auto-detect)
+REM   GENERATOR  - CMake generator (Forced to Visual Studio to fix compiler error)
 REM   ARCH       - Architecture for multi-config generators (default: x64)
 REM   CONFIGS    - Configurations to build, space-separated (default: Release Debug)
 REM ---------------------------------------------------------------------------
 if "%GENERATOR%"=="" (
-    where ninja >nul 2>nul
-    if not errorlevel 1 (
-        set "GENERATOR=Ninja Multi-Config"
-    ) else (
-        set "GENERATOR=Visual Studio 17 2022"
-    )
+    set "GENERATOR=Visual Studio 17 2022"
 )
 if "%ARCH%"=="" set "ARCH=x64"
 if "%CONFIGS%"=="" set "CONFIGS=Release Debug"
@@ -41,4 +36,5 @@ exit /b 0
 
 :fail
 echo [ERROR] Build failed.
+pause
 exit /b 1

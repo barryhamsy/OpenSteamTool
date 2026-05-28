@@ -44,11 +44,6 @@ static std::unordered_map<HMODULE, PatternMap> g_moduleMaps;
 // popup with a second popup listing every dependent hook.
 static std::unordered_set<HMODULE> g_failedModules;
 
-// Set to true the first time any Load() call resolves patterns from a
-// remote mirror (GitHub/jsDelivr/custom). Stays false if every Load()
-// fell back to the local cache. Snapshotted at init; never reset.
-static bool g_remoteEverSucceeded = false;
-
 // functions whose names were not found during FindPattern
 static std::vector<std::string> g_missingFunctions;
 
@@ -306,7 +301,6 @@ bool Load(HMODULE module, const std::string& dllPath, const std::string& ghSubdi
                 LOG_WARN("PatternLoader: could not open {} for writing",
                          cachePath.string());
             }
-            g_remoteEverSucceeded = true;
             LOG_INFO("PatternLoader: loaded {} patterns for {} (remote)",
                      map.size(), ghSubdir);
             g_moduleMaps[module] = std::move(map);
@@ -430,11 +424,6 @@ void ReportMissingFunctions()
                     "OpenSteamTool - Missing Signatures",
                     MB_OK | MB_ICONWARNING | MB_TOPMOST);
     }).detach();
-}
-
-bool WasRemoteReachable()
-{
-    return g_remoteEverSucceeded;
 }
 
 } // namespace PatternLoader

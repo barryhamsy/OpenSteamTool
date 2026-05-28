@@ -1,0 +1,3 @@
+LIBRARY "dwrite"
+EXPORTS
+    DWriteCreateFactory @1

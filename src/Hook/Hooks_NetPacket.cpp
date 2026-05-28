@@ -849,14 +849,22 @@ namespace Hooks_NetPacket_RichPresence {
 //
 //  Outgoing: CMsgClientGamesPlayed (eMsg 742 / 5410)
 //
-//  When a game launched with -onlinefix reports appid 480, replace
-//  game_extra_info with the real game's localized name so friends
-//  see the correct title.
+//  Two spoof paths:
+//   (A) Engine path — game launched with -onlinefix. SpawnProcess
+//       (Hooks_Misc) already rewrote pGameID to 480, so game_id
+//       arrives here as 480. We only fill game_extra_info with the
+//       real localized name. ResolveAppId() returns the real appid
+//       via g_OnlineFixRealAppId.
+//   (B) Network-only path — depot-configured game launched WITHOUT
+//       -onlinefix. SpawnProcess did NOT touch it, so game_id is the
+//       real appid. We rewrite the low 32 bits to 480 on the outgoing
+//       broadcast and inject the real name, so friends see the title
+//       while the server still treats it as Spacewar.
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_OnlineFix {
 
     bool HandleSend(const uint8* pBody, uint32 cbBody,
-                    const uint8* pHdr, uint32 cbHdr)
+        const uint8* pHdr, uint32 cbHdr)
     {
         CMsgClientGamesPlayed msg;
         if (!msg.ParseFromArray(pBody, cbBody)) {
@@ -865,6 +873,8 @@ namespace Hooks_NetPacket_OnlineFix {
         }
         LOG_ONLINEFIX_DEBUG("OnlineFix: original body:\n{}", msg.DebugString());
 
+        // Track Rich Presence locally BEFORE we manipulate the AppIDs,
+        // so g_PlayingAppId sees the true (pre-spoof) topmost appid.
         Hooks_NetPacket_RichPresence::TrackSend(msg, pHdr, cbHdr);
 
         bool patched = false;
@@ -872,9 +882,8 @@ namespace Hooks_NetPacket_OnlineFix {
             auto* game = msg.mutable_games_played(i);
             AppId_t appid = static_cast<AppId_t>(game->game_id() & UINT32_MAX);
 
-            // SpawnProcess rewrites pGameID to 480, so game_id is already 480.
-            // Fill game_extra_info with the real game name.
             if (appid == kOnlineFixAppId) {
+                // ── Path A: already 480 (SpawnProcess engine spoof) ──
                 AppId_t realAppId = Hooks_Misc::ResolveAppId();
                 if (realAppId && LuaConfig::HasDepot(realAppId)) {
                     std::string name = Hooks_Misc::GetGameNameByAppID(realAppId);
@@ -885,6 +894,25 @@ namespace Hooks_NetPacket_OnlineFix {
                             name, realAppId);
                     }
                 }
+            }
+            else if (LuaConfig::HasDepot(appid)) {
+                // ── Path B: depot game NOT launched via -onlinefix ──
+                // SpawnProcess left game_id at the real appid; rewrite the
+                // outgoing broadcast to 480 and inject the real name so
+                // friends see the title without the server seeing it.
+                std::string name = Hooks_Misc::GetGameNameByAppID(appid);
+
+                uint64 prevId = game->game_id();
+                uint64 newId = (prevId & ~static_cast<uint64>(UINT32_MAX))
+                    | kOnlineFixAppId;
+                game->set_game_id(newId);
+
+                if (!name.empty())
+                    game->set_game_extra_info(name);
+
+                patched = true;
+                LOG_ONLINEFIX_INFO("Network Spoof: broadcast AppID {} -> 480 ('{}')",
+                    appid, name);
             }
         }
 

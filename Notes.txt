@@ -1,0 +1,38 @@
+1. Hooks_IPC.cpp (The Ultimate Fix)
+This is the holy grail that finally eradicated the stubborn yellow cloud error icon.
+
+What we fixed: We integrated your legacy CloudBypass logic into the new dynamic handler system.
+
+How it works: It intercepts the tiny 14-byte Inter-Process Communication (IPC) packet that the frontend Chromium UI sends to the backend Steam Engine to check the RemoteStorage status. If the engine tries to reply with an error, this hook intercepts the buffer and overwrites the status code to 1 (k_EResultOK).
+
+The Result: The UI is gaslit into believing a flawless sync just occurred, clearing the error permanently while still letting legitimate, larger local file saves pass through untouched.
+
+2. Hooks_KeyValues.cpp (The Spoofer & Bandwidth Saver)
+We heavily optimized this file, ditching the newer, failing logic in favor of your highly aggressive, on-the-fly tree parser from the older build.
+
+What we fixed: We completely removed the reliance on ReadAsBinary and restored the hkFindOrCreateKey hook using your new RESOLVE_D pattern loader.
+
+How it works: It tracks the KeyValues tree as Steam builds it in memory. When it detects AppID 480 (Spacewar), it injects your real game's name, icon, and logo. When it detects a game you manage, it forces the ufs (User File Storage) key to "0".
+
+The Core Hook Lineup
+Hooks_IPC.cpp (The Frontend Filter)
+
+The Job: Intercepts IPCProcessMessage. This is your heavy hitter that runs the CloudBypass logic, intercepting tiny status packets from the engine and forcing a k_EResultOK (1) response to permanently silence the Chromium UI cloud errors.
+
+Hooks_IPC_ISteamUser.cpp (The Identity Spoofer)
+
+The Job: Works alongside the main IPC hook to handle specific ISteamUser interface commands, like manipulating encrypted app tickets or adjusting user license packets.
+
+Hooks_KeyValues.cpp (The Visual & Backend Configurator)
+
+The Job: Runs the stateful FindOrCreateKey tracking tree. It handles boot-time string suppression (ufs = 0) and dynamically replaces all "Spacewar" names, icons, and logos with your real game assets.
+
+Hooks_NetPacket.cpp (The Network Interceptor)
+
+The Job: Hooks into low-level messaging layers like RecvPkt. It monitors and alters incoming backend server traffic before Steam processes the raw network data packets.
+
+Hooks_Misc.cpp (The Engine Backbone)
+
+The Job: The unsung hero. It doesn't intercept features itself, but it provides vital global helpers like ResolveAppId(), GetGameNameByAppID(), and GetAppIDForCurrentPipe() that every single one of your other hooks relies on to know what game is running.
+
+The Result: Your library graphics look clean, and the backend Steam Engine doesn't waste CPU or bandwidth attempting impossible network uploads.
