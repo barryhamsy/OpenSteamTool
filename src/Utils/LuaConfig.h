@@ -8,13 +8,15 @@
 
 namespace LuaConfig{
     bool HasDepot(AppId_t appId, bool checkOwned=true);
+    bool IsOwned(AppId_t appId);
     void MarkOwned(AppId_t appId);
     std::vector<AppId_t> GetAllDepotIds();
     std::vector<uint8> GetDecryptionKey(AppId_t appId);
     uint64_t GetAccessToken(AppId_t appId);
     uint64_t GetStatSteamId(AppId_t appId);
     bool pinApp(AppId_t appId);
-
+    uint32_t GetPurchaseTime(AppId_t appId);
+    
     struct ManifestOverride {
           uint64_t gid;
           uint64_t size;

@@ -16,9 +16,9 @@ namespace Hooks_Misc {
     // GetAppIDForCurrentPipe.
     AppId_t GetAppIDForCurrentPipeWrap();
 
-    // Grow a CUtlBuffer to at least 'size' bytes and set m_Put = size.
+    // Grow a CUtlBuffer to at least 'newCapacity' bytes and set m_Put = newCapacity.
     // Uses CUtlBuffer::EnsureCapacity from steamclient, resolved on first call.
-    bool EnsureBufferSize(CUtlBuffer* pWrite, int32 size);
+    bool EnsureBufferCapacity(CUtlBuffer* pWrite, uint32 newCapacity,bool updatePut = false);
 
     // Resolve the real appid: if OnlineFix is active return real appid,
     // otherwise fall back to GetAppIDForCurrentPipe().

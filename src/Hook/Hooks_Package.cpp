@@ -2,19 +2,22 @@
 #include "HookMacros.h"
 #include "Hooks_SteamUI.h"
 #include "dllmain.h"
+#include "Utils/VehCommon.h"
 
 namespace {
     RESOLVE_FUNC(CUtlMemoryGrow,               void*, CUtlVector<AppId_t>*, int);
     RESOLVE_FUNC(MarkLicenseAsChanged,         int64, void*, uint32, bool);
     RESOLVE_FUNC(ProcessPendingLicenseUpdates, bool,  void*);
 
+    CAPTURE_THIS_FUNC(GetPackageInfo, PackageInfo*,g_pCPackageInfo,void* pThis, uint32 packageId, uint64 accessToken);
+    
     void* g_pCUser = nullptr;
-    void* g_pCPackageInfo = nullptr;
     PackageInfo* g_pInjectedPackageInfo = nullptr;
     bool  g_licenseInitialized = false;
     bool  g_licenseRefreshPending = false;
 
     constexpr PackageId_t kInjectedPackageId = 0;
+    constexpr uint64_t kInjectedPkgAccessToken = 10660652434190618804ull;
 
     bool MarkLicenseAsChangedAndProcessUpdates() {
         if (!g_pCUser || !oMarkLicenseAsChanged || !oProcessPendingLicenseUpdates) {
@@ -43,10 +46,12 @@ namespace {
     }
 
     bool InitFakeLicenseOnce(PackageInfo* pPkg) {
-        if (!pPkg) {
-            LOG_PACKAGE_WARN("InitFakeLicense: null PackageInfo pointer");
+        // check package status before injecting
+        if (pPkg->Status != EPackageStatus::Available) {
+            LOG_PACKAGE_WARN("InitFakeLicenseOnce: package status is not Available ({}), skipping injection", static_cast<int>(pPkg->Status));
             return false;
         }
+
         // Inject all depots from config into the fake license. 
         std::vector<AppId_t> appIds = LuaConfig::GetAllDepotIds();
         if (!appIds.empty()) {
@@ -67,45 +72,20 @@ namespace {
         return true;
     }
 
-    HOOK_FUNC(LoadPackage, bool, PackageInfo* pInfo, uint8* sha1, int32 cn, void* p4) {
-        bool result = oLoadPackage(pInfo, sha1, cn, p4);
-        
-        if (pInfo->PackageId == 0) {
-            std::vector<AppId_t> appIds = LuaConfig::GetAllDepotIds();
-            if (!appIds.empty()) {
-                uint32 oldSize = pInfo->AppIdVec.m_Size;
-                uint32 numToAdd = static_cast<uint32>(appIds.size());
-                LOG_PACKAGE_INFO("LoadPackage(PackageId={}): adding {} apps, oldSize={}", kInjectedPackageId, numToAdd, oldSize);
-                if (!CUtlMemoryGrowWrap(&pInfo->AppIdVec, numToAdd)) {
-                    LOG_PACKAGE_WARN("LoadPackage(PackageId={}): failed to grow AppId vector", kInjectedPackageId);
-                    return result;
-                }
-                for (uint32 i = 0; i < numToAdd; i++)
-                pInfo->AppIdVec.m_Memory.m_pMemory[oldSize + i] = appIds[i];
+    bool TryInitFakeLicenseOnce() {
+        if (g_licenseInitialized) return true;
+        if(CAPTURE_READY(GetPackageInfo)){
+            PackageInfo* pPkg = oGetPackageInfo(g_pCPackageInfo, kInjectedPackageId, kInjectedPkgAccessToken);
+            if(!pPkg) {
+                LOG_PACKAGE_WARN("TryInitFakeLicenseOnce: GetPackageInfo returned null for injected package");
+                return false;
             }
+            if(!g_pInjectedPackageInfo) g_pInjectedPackageInfo = pPkg;
+            return InitFakeLicenseOnce(pPkg);
         }
-        
-        return result;
+        return false;
     }
-    
-    HOOK_FUNC(GetPackageInfo, PackageInfo*, void* pPackageInfoCache, uint32 packageId, uint64 accessToken) {
-        if (!g_pCPackageInfo) {
-            g_pCPackageInfo = pPackageInfoCache;
-            LOG_PACKAGE_DEBUG("GetPackageInfo: captured CPackageInfo {}", g_pCPackageInfo);
-        }
-        // LOG_PACKAGE_TRACE("GetPackageInfo: package cache {}, packageId {}, accessToken {}", pPackageInfoCache, packageId, accessToken);
-        PackageInfo* pPkg = oGetPackageInfo(pPackageInfoCache, packageId, accessToken);
-        if (packageId == 0 && pPkg) {
-            if(!g_pInjectedPackageInfo) {
-                g_pInjectedPackageInfo = pPkg;
-                LOG_PACKAGE_INFO("GetPackageInfo: g_pInjectedPackageInfo set to {}", (void*)g_pInjectedPackageInfo);
-            }
-            if(!g_licenseInitialized) {
-                InitFakeLicenseOnce(pPkg);
-            }
-        }
-        return pPkg;
-    }
+
 
     HOOK_FUNC(CheckAppOwnership, bool, void* pObj, AppId_t appId, AppOwnership* pOwn) {
         if (!g_pCUser) {
@@ -114,13 +94,14 @@ namespace {
         }
 
         bool result = oCheckAppOwnership(pObj, appId, pOwn);
-        TryProcessPendingLicenseRefresh();
+        TryInitFakeLicenseOnce();
 
         // LOG_PACKAGE_TRACE("CheckAppOwnership: AppId={} result={} {}", appId, result, pOwn->DebugString());
-        if (LuaConfig::HasDepot(appId)) {
+        if (LuaConfig::HasDepot(appId,false)) {
             if (result && pOwn->ExistInPackageNums > 1) {
                 // Actually owned — record so HasDepot excludes it going forward
                 LuaConfig::MarkOwned(appId);
+                pOwn->ReleaseState = EAppReleaseState::Released;
             } else {
                 pOwn->PackageId    = kInjectedPackageId;
                 pOwn->ReleaseState = EAppReleaseState::Released;
@@ -139,17 +120,15 @@ namespace Hooks_Package {
         RESOLVE_C(MarkLicenseAsChanged);
         RESOLVE_C(ProcessPendingLicenseUpdates);
 
+        ARM_CAPTURE_C(GetPackageInfo);
+
         HOOK_BEGIN();
-        // INSTALL_HOOK_C(LoadPackage);
-        INSTALL_HOOK_C(GetPackageInfo);
         INSTALL_HOOK_C(CheckAppOwnership);
         HOOK_END();
     }
 
     void Uninstall() {
         UNHOOK_BEGIN();
-        // UNINSTALL_HOOK_C(LoadPackage);
-        UNINSTALL_HOOK_C(GetPackageInfo);
         UNINSTALL_HOOK_C(CheckAppOwnership);
         UNHOOK_END();
     }
@@ -163,27 +142,40 @@ namespace Hooks_Package {
 
         // ── Remove depots that were unloaded ──
         std::vector<AppId_t> removals = LuaConfig::TakePendingRemovals();
+        LOG_PACKAGE_DEBUG("NotifyLicenseChanged: processing {} removals", removals.size());
         uint32_t removedCount = 0;
         for (AppId_t id : removals) {
             if (pPkg->AppIdVec.FindAndFastRemove(id)) {
                 ++removedCount;
                 LOG_PACKAGE_DEBUG("NotifyLicenseChanged: removed AppId {}", id);
+            }else {
+                LOG_PACKAGE_WARN("NotifyLicenseChanged: AppId {} not found in package AppIdVec during removal", id);
             }
         }
 
         // ── Add depots that are newly loaded ──
         std::vector<AppId_t> additions = LuaConfig::TakePendingAdditions();
+        std::unordered_set<AppId_t> addedIds;
+        LOG_PACKAGE_DEBUG("NotifyLicenseChanged: processing {} additions", additions.size());
         if (!additions.empty()) {
             uint32_t oldSize = pPkg->AppIdVec.m_Size;
             if (CUtlMemoryGrowWrap(&pPkg->AppIdVec, additions.size())) {
+                // An applied addition invalidates any UI removal that has not
+                // reached the UI thread yet.
+                for (AppId_t id : additions)
+                    Hooks_SteamUI::CancelRemoval(id);
+
                 for (size_t i = 0; i < additions.size(); ++i) {
                     pPkg->AppIdVec.m_Memory.m_pMemory[oldSize + i] = additions[i];
+                    addedIds.insert(additions[i]);
                     LOG_PACKAGE_DEBUG("NotifyLicenseChanged: inserted AppId {} at [{}]", additions[i], oldSize + i);
                 }
+            }else {
+                LOG_PACKAGE_WARN("NotifyLicenseChanged: failed to grow AppId vector for additions");
             }
         }
 
-        if (additions.empty() && removedCount == 0) {
+        if (addedIds.empty() && removedCount == 0) {
             LOG_PACKAGE_DEBUG("NotifyLicenseChanged: no changes");
             return;
         }
@@ -193,13 +185,20 @@ namespace Hooks_Package {
             LOG_PACKAGE_WARN("NotifyLicenseChanged: failed to mark license as changed");
             return;
         }
-        LOG_PACKAGE_INFO("NotifyLicenseChanged: {} added, {} removed", additions.size(), removedCount);
+        LOG_PACKAGE_INFO("NotifyLicenseChanged: {} added, {} removed", addedIds.size(), removedCount);
 
-        // CSteamUIAppController caches its own AppOverview entries and doesn't
-        // re-query subscription state on package mutation; remove them
-        // explicitly so the library UI reflects the dropped license.
+        // Queue UI removals for the main-thread RunFrame hook to drain.
+        // Never touch MarkAppChange from this (FileWatcher) thread.
+        size_t queuedRemovalCount = 0;
         for (AppId_t id : removals) {
-            Hooks_SteamUI::RemoveAppAndSendChange(id);
+            // ParseFile unloads the old file before parsing the replacement.
+            // Do not queue that transient removal when the id was added again.
+            if (!addedIds.contains(id)) {
+                Hooks_SteamUI::QueueRemoval(id);
+                ++queuedRemovalCount;
+            }
         }
+        LOG_PACKAGE_DEBUG("NotifyLicenseChanged: queued {} UI removals, skipped {} transient removals",
+                          queuedRemovalCount, removals.size() - queuedRemovalCount);
     }
 }

@@ -4,131 +4,97 @@
 #include "Utils/VehCommon.h"
 #include "dllmain.h"
 
+#include <fstream>
+#include <string>
+
 namespace {
-    // ── Resolve-only functions ─────────────────────────────────────
-    RESOLVE_FUNC(CUtlBufferEnsureCapacity,     void*, CUtlBuffer*, int);
+    RESOLVE_FUNC(CUtlBufferEnsureCapacity, void*, CUtlBuffer* pCUtlBuffer, uint32 newCapacity);
 
-    // ── VEH-captured functions (one-shot int3) ───────────────────────────────
-    // On int3 hit, ctx->Rcx is stored to the named output variable.
-    CAPTURE_THIS_FUNC(GetAppIDForCurrentPipe, AppId_t,      g_steamEngine,    void*);
-    CAPTURE_THIS_FUNC(GetAppDataFromAppInfo,  int64,        g_pCAppInfoCache, void*, AppId_t, const char*, uint8*, int32);
+    CAPTURE_THIS_FUNC(GetAppIDForCurrentPipe, AppId_t, g_steamEngine, void*);
 
-    // Assumes one game at a time.  Set by SpawnProcess VEH when -onlinefix
-    // is detected; cleared when a non-onlinefix game launches.
     AppId_t   g_OnlineFixRealAppId;
     std::unordered_map<AppId_t, std::string> g_GameNameCache;
-
-    // ── Offline gate for GetOrAddAppData ──────────────────────────
-    // Snapshotted at Install() from PatternLoader::WasRemoteReachable().
-    // True = at least one PatternLoader fetch hit the network → treat
-    // session as online → GetOrAddAppData does nothing (PICS will resolve
-    // newly added depots naturally).
-    // False = all pattern fetches fell back to cache → treat session as
-    // offline → GetOrAddAppData applies skip_flag so license updates
-    // complete without waiting for PICS responses that will never arrive.
-    // Snapshotted, never re-evaluated — if connectivity changes mid-
-    // session, relaunch Steam.
     bool g_IsOffline = false;
+    void* g_pCAppInfoCache = nullptr;
 
+    // ── Safe Offline Checker ──
+    bool IsSteamInOfflineMode() {
+        if (wcsstr(GetCommandLineW(), L"-offline")) return true;
 
-    // ── SpawnProcess interception ────────────────────────────────────────────
-    // CUser_SpawnProcess(pCUser, pExePath, pCommandLine, pWorkingDir,
-    //                    pGameID, ...)
-    // arg1=pCUser, arg2=pExePath, arg3=pCommandLine, arg4=pWorkingDir
-    // arg5=pGameID (CGameID*; low 24 bits = AppId)
+        char steamPath[MAX_PATH] = { 0 };
+        DWORD pathSize = sizeof(steamPath);
+        HKEY hKey;
+        if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Valve\\Steam", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            RegQueryValueExA(hKey, "SteamPath", nullptr, nullptr, reinterpret_cast<LPBYTE>(steamPath), &pathSize);
+            RegCloseKey(hKey);
+
+            if (steamPath[0] != '\0') {
+                std::string vdfPath = std::string(steamPath) + "/config/loginusers.vdf";
+                std::ifstream file(vdfPath);
+                std::string line;
+                while (std::getline(file, line)) {
+                    if (line.find("\"WantsOfflineMode\"") != std::string::npos && line.find("\"1\"") != std::string::npos) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     static void OnSpawnProcessHit(PCONTEXT ctx, const VehCommon::Int3Site& /*site*/) {
         CGameID* pGameID = VehCommon::GetArg<CGameID*>(ctx, 5);
         AppId_t appId = static_cast<AppId_t>(pGameID->AppID(true));
         const char* cmdLine = VehCommon::GetArg<const char*>(ctx, 3);
 
-        if (LuaConfig::HasDepot(appId) && cmdLine && strstr(cmdLine, "-onlinefix")) 
-        {
+        if (LuaConfig::HasDepot(appId) && cmdLine && strstr(cmdLine, "-onlinefix")) {
             g_OnlineFixRealAppId = appId;
             pGameID->SetAppID(kOnlineFixAppId);
-            LOG_MISC_INFO("SpawnProcess: appid {} -> {}, cmd=\"{}\"",appId, kOnlineFixAppId, cmdLine);
-        } else {
+        }
+        else {
             g_OnlineFixRealAppId = 0;
         }
     }
 
-    // ── SteamController_OptedInMask ──────────────────────────────────────────
-    // Called by CUser_BuildSpawnEnvBlock with pGameID's appid to
-    // compute EnableConfiguratorSupport and the SDL_* env vars.
-    // With 480 the spawned game inherits Spacewar's Steam Input
-    // opt-in and gameoverlayrenderer hijacks the XInput stream.
-    HOOK_FUNC(OptedInMask, int64,void* pThis, AppId_t appId)
-    {
-        if (appId == kOnlineFixAppId && g_OnlineFixRealAppId) {
-            LOG_MISC_INFO("OptedInMask: appid {} -> {}",appId, g_OnlineFixRealAppId);
-            appId = g_OnlineFixRealAppId;
-        }
+    HOOK_FUNC(OptedInMask, int64, void* pThis, AppId_t appId) {
+        if (appId == kOnlineFixAppId && g_OnlineFixRealAppId) appId = g_OnlineFixRealAppId;
         return oOptedInMask(pThis, appId);
     }
 
-    // ── CUser_BuildSpawnEnvBlock ─────────────────────────────────────────────
-    // pOverlayCGameID drives SteamOverlayGameId, which the in-game
-    // overlay reads for screenshot tags, community URLs, and asset
-    // selection.  pCGameID drives SteamGameId / SteamAppId; leave it
-    // at 480 so the in-game ownership bypass holds.
-    HOOK_FUNC(BuildSpawnEnvBlock, int64,
-              void* pThis, CGameID* pCGameID, void* a3, void* env,
-              CGameID* pOverlayCGameID, void* a6, int a7,
-              void* a8, void* a9, unsigned int a10, char a11)
-    {
-        if (g_OnlineFixRealAppId && pOverlayCGameID
-            && pOverlayCGameID->AppID(true) == kOnlineFixAppId) 
-        {
-            LOG_MISC_INFO("BuildSpawnEnvBlock: SetAppID in OverlayCGameID {} -> {}",
-                          pOverlayCGameID->AppID(true), g_OnlineFixRealAppId);
+    HOOK_FUNC(BuildSpawnEnvBlock, int64, void* pThis, CGameID* pCGameID, void* a3, void* env, CGameID* pOverlayCGameID, void* a6, int a7, void* a8, void* a9, unsigned int a10, char a11) {
+        if (g_OnlineFixRealAppId && pOverlayCGameID && pOverlayCGameID->AppID(true) == kOnlineFixAppId) {
             pOverlayCGameID->SetAppID(g_OnlineFixRealAppId);
         }
-        return oBuildSpawnEnvBlock(pThis, pCGameID, a3, env,
-                                    pOverlayCGameID, a6, a7,
-                                    a8, a9, a10, a11);
+        return oBuildSpawnEnvBlock(pThis, pCGameID, a3, env, pOverlayCGameID, a6, a7, a8, a9, a10, a11);
     }
 
-    // CAppInfoCache::GetOrAddAppData
-    //
-    // GATED ON OFFLINE STATE (g_IsOffline). See block above for rationale.
-    // Online: do nothing — let PICS resolve placeholder appinfo for newly
-    //         added depots naturally. Otherwise we'd condemn brand-new
-    //         AppIDs to "known-unknown" before PICS had a chance, and
-    //         new-game unlocks would silently fail online.
-    // Offline: apply skip_flag exactly as upstream did, so
-    //          ProcessPendingLicenseUpdates completes without waiting for
-    //          PICS responses that will never arrive.
-    HOOK_FUNC(GetOrAddAppData,CAppData*,void* pCache, AppId_t appId,bool bCreate)
-    {
+    HOOK_FUNC(GetOrAddAppData, CAppData*, void* pCache, AppId_t appId, bool bCreate) {
         CAppData* pData = oGetOrAddAppData(pCache, appId, bCreate);
-        if (!g_IsOffline) return pData;  // online: hook is a passthrough
+        if (!g_IsOffline) return pData;
         if (LuaConfig::HasDepot(appId, false) && pData && !bCreate && pData->IsUnresolvedAppInfo()) {
-            LOG_MISC_DEBUG("GetOrAddAppData (offline): Marking appId {} as skip_flag=true to bypass license update blocking", appId);
             pData->bSkipFlag = true;
         }
         return pData;
+    }
+
+    // ── Pure Cache Pointer Capture (No overrides!) ──
+    HOOK_FUNC(GetAppDataFromAppInfo, int64, void* pThis, AppId_t appId, const char* key, uint8* buf, int32 bufSize) {
+        g_pCAppInfoCache = pThis;
+        return oGetAppDataFromAppInfo(pThis, appId, key, buf, bufSize);
     }
 }
 
 namespace Hooks_Misc {
     void Install() {
         RESOLVE_C(CUtlBufferEnsureCapacity);
-
         ARM_CAPTURE_C(GetAppIDForCurrentPipe);
-        ARM_CAPTURE_C(GetAppDataFromAppInfo);
-
         ARM_INT3_C(SpawnProcess, true, &OnSpawnProcessHit, nullptr);
 
-        // Snapshot offline state from PatternLoader's actual fetch result.
-        // PatternLoader::Load() must have completed for both DLLs before
-        // Hooks_Misc::Install() runs (it does — see dllmain init order).
-        g_IsOffline = !PatternLoader::WasRemoteReachable();
-        LOG_MISC_INFO("Hooks_Misc: offline mode = {} (GetOrAddAppData skip_flag {})",
-                      g_IsOffline, g_IsOffline ? "ACTIVE" : "passthrough");
+        g_IsOffline = !PatternLoader::WasRemoteReachable() || IsSteamInOfflineMode();
 
         HOOK_BEGIN();
         INSTALL_HOOK_C(BuildSpawnEnvBlock);
         INSTALL_HOOK_C(OptedInMask);
         INSTALL_HOOK_C(GetOrAddAppData);
+        INSTALL_HOOK_C(GetAppDataFromAppInfo);
         HOOK_END();
     }
 
@@ -137,64 +103,41 @@ namespace Hooks_Misc {
         UNINSTALL_HOOK(BuildSpawnEnvBlock);
         UNINSTALL_HOOK(OptedInMask);
         UNINSTALL_HOOK(GetOrAddAppData);
+        UNINSTALL_HOOK(GetAppDataFromAppInfo);
         UNHOOK_END();
     }
 
     AppId_t GetAppIDForCurrentPipeWrap() {
-        if (!CAPTURE_READY(GetAppIDForCurrentPipe)) {
-            LOG_MISC_WARN("GetAppIDForCurrentPipeWrap called before capture — returning 0");
-            return 0;
-        }
-        auto appid = oGetAppIDForCurrentPipe(g_steamEngine);
-        if (!appid) {
-            LOG_MISC_TRACE("GetAppIDForCurrentPipeWrap: AppId=0(Not GamePipe)");
-        } else {
-            LOG_MISC_DEBUG("GetAppIDForCurrentPipeWrap: AppId={}", appid);
-        }
-        return appid;
+        if (!CAPTURE_READY(GetAppIDForCurrentPipe)) return 0;
+        return oGetAppIDForCurrentPipe(g_steamEngine);
     }
 
-    
     AppId_t ResolveAppId() {
         if (g_OnlineFixRealAppId) return g_OnlineFixRealAppId;
         return GetAppIDForCurrentPipeWrap();
     }
-    
-    bool EnsureBufferSize(CUtlBuffer* pWrite, int32 size)
-    {
+
+    bool EnsureBufferCapacity(CUtlBuffer* pWrite, uint32 newCapacity, bool updatePut) {
         if (oCUtlBufferEnsureCapacity) {
-            LOG_MISC_DEBUG("Before ensuring CUtlBuffer capacity: {}", pWrite->DebugString());
-            oCUtlBufferEnsureCapacity(pWrite, size);
-            LOG_MISC_DEBUG("After ensuring CUtlBuffer capacity: {}", pWrite->DebugString());
+            oCUtlBufferEnsureCapacity(pWrite, newCapacity);
+            if (updatePut) pWrite->m_Put = newCapacity;
             return true;
         }
-        LOG_MISC_WARN("EnsureBufferSize: oCUtlBufferEnsureCapacity not resolved");
         return false;
     }
 
-    // ── Game name ────────────────────────────────────────────────
-    std::string GetGameNameByAppID(AppId_t appId)
-    {
+    std::string GetGameNameByAppID(AppId_t appId) {
         auto it = g_GameNameCache.find(appId);
         if (it != g_GameNameCache.end()) return it->second;
 
         std::string name;
-
-        if (CAPTURE_READY(GetAppDataFromAppInfo)) {
+        if (oGetAppDataFromAppInfo && g_pCAppInfoCache) {
             char buf[256] = {};
-            // "common/name" triggers auto-localization: the function detects
-            // prefix "common" (keyType=2) + key "name", then tries
-            // "name_localized/<current_lang>" before falling back to "name".
-            // Returns strlen+1 on success, -1 on failure.
-            int64 len = oGetAppDataFromAppInfo(g_pCAppInfoCache, appId, "common/name",
-                reinterpret_cast<uint8*>(buf), sizeof(buf));
-            if (len > 1)
-                name.assign(buf, static_cast<size_t>(len - 1));
+            int64 len = oGetAppDataFromAppInfo(g_pCAppInfoCache, appId, "common/name", reinterpret_cast<uint8*>(buf), sizeof(buf));
+            if (len > 1) name.assign(buf, static_cast<size_t>(len - 1));
         }
 
-        LOG_MISC_DEBUG("GetGameNameByAppID({}): {}", appId, name);
         g_GameNameCache[appId] = name;
         return name;
     }
-
 }

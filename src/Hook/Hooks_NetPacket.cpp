@@ -1,5 +1,5 @@
 #include "Hooks_NetPacket.h"
-#include "Hooks_Manifest.h"
+#include "Utils/ManifestClient.h"
 #include "Hooks_Misc.h"
 #include "HookMacros.h"
 #include "dllmain.h"
@@ -488,7 +488,7 @@ namespace Hooks_NetPacket_Manifest {
         auto task = std::async(std::launch::async,
             [manifestGid, depotId, appId]() -> uint64 {
                 uint64 code = 0;
-                Hooks_Manifest::FetchManifestRequestCode(manifestGid, &code, appId, depotId);
+                ManifestClient::FetchManifestRequestCode(manifestGid, &code, appId, depotId);
                 return code;
             });
 
@@ -864,7 +864,7 @@ namespace Hooks_NetPacket_RichPresence {
 namespace Hooks_NetPacket_OnlineFix {
 
     bool HandleSend(const uint8* pBody, uint32 cbBody,
-        const uint8* pHdr, uint32 cbHdr)
+                    const uint8* pHdr, uint32 cbHdr)
     {
         CMsgClientGamesPlayed msg;
         if (!msg.ParseFromArray(pBody, cbBody)) {
