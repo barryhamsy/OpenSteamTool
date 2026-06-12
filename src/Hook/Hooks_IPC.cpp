@@ -142,18 +142,26 @@ namespace {
                         for (int i = 0; i <= dataLen - 8; i++) {
                             AppId_t id = *reinterpret_cast<AppId_t*>(data + i);
 
-                            // STRICT TARGET LOCK: Stop checking HasDepot() against thousands of IDs!
-                            // We ONLY scrub if the UI is drawing the exact Spacewar ID (480) or the currently spoofed game.
-                            // This mathematically guarantees other games are untouched!
-                            AppId_t activeRealId = Hooks_Misc::ResolveAppId();
-                            if (id == kOnlineFixAppId || (activeRealId > 0 && id == activeRealId)) {
-
-                                uint32_t* state = reinterpret_cast<uint32_t*>(data + i + 4);
+                            // Cover every spoofed AppID, not just the running one.
+                            // At library-view time no game is running so ResolveAppId()=0
+                            // and the old filter missed them all.
+                            //
+                            // Safety bounds: Steam AppIDs are 1,000–3,000,000ish.
+                            // Values below 1000 or above 0x02000000 are almost certainly
+                            // field sizes, pointers, or flags — not AppIDs.  The HasDepot
+                            // lookup filters to our exact spoofed list.
+                            if (id >= 480 && id < 0x02000000 && LuaConfig::HasDepot(id)) {
                                 const uint32_t k_CloudMask = 0x001C0000;
 
-                                // Extreme Validation: Only wipe if it is unmistakably an AppState bitmask
-                                if ((*state & k_CloudMask) != 0 && *state < 0x02000000) {
-                                    *state &= ~k_CloudMask; // Safely erase the UI error
+                                // Check multiple offsets — different Steam versions pack
+                                // AppState flags at different positions after the AppID.
+                                for (int offset = 4; offset <= 24; offset += 4) {
+                                    if (i + offset + 4 <= dataLen) {
+                                        uint32_t* state = reinterpret_cast<uint32_t*>(data + i + offset);
+                                        if ((*state & k_CloudMask) != 0 && *state < 0x02000000) {
+                                            *state &= ~k_CloudMask;
+                                        }
+                                    }
                                 }
                             }
                         }

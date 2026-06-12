@@ -1,0 +1,53 @@
+# user_patterns/steamclient.toml
+#
+# Place this file at:
+#   G:\Program Files (x86)\Steam\opensteamtool\user_patterns\steamclient.toml
+#
+# OST loads this on every startup with NO network request and NO SHA-256 check.
+# Add any RVAs you find locally here.
+#
+# ── HOW TO FIND RVAs WITH x64dbg ─────────────────────────────────────────────
+#
+#  1. While Steam is running, open x64dbg → File → Attach → select steam.exe
+#  2. In the Symbols panel, type "steamclient64" in the module filter
+#  3. Use Ctrl+G in CPU panel, type: steamclient64.dll+0xA19E80
+#     That jumps to CloseAppCloud — already known, use it as your anchor.
+#  4. Right-click that address → "Follow in Disassembler"
+#     Look at the first MOV/PUSH instructions to identify the class this
+#     belongs to (CClientRemoteStorage).
+#  5. In the Symbols panel, search for:
+#       BFileWrite    BFileRead    GetFileCount    GetFileNameAndSize    FileExists
+#     If symbols are stripped, search String References (right-click disasm →
+#     Search for → All Modules → String References) for "BFileWrite" etc.
+#  6. Once at the function start (look for prologue: PUSH RBP or SUB RSP, xx):
+#       Right-click the address → Copy → RVA
+#     The RVA is the offset from steamclient64.dll base — paste it below.
+#
+# ── ENTRIES ──────────────────────────────────────────────────────────────────
+
+[0x80BD1AEB]
+name = "CloudStorage_BFileWrite"
+rva  = ""   # e.g. "0xB1A200" — fill in after finding with x64dbg
+
+[0x024CAF10]
+name = "CloudStorage_BFileRead"
+rva  = ""
+
+[0x664862FD]
+name = "CloudStorage_GetFileCount"
+rva  = ""
+
+[0xECDBA75F]
+name = "CloudStorage_GetFileNameAndSize"
+rva  = ""
+
+[0xE0A93B32]
+name = "CloudStorage_FileExists"
+rva  = ""
+
+# ── ALREADY IN REMOTE TOML — shown here for navigation reference ─────────────
+# Use these known RVAs as anchors in x64dbg when searching for neighbors.
+#
+# [0x04691B23]
+# name = "CloseAppCloud"          ← start here in x64dbg
+# rva  = "0xA19E80"               ← steamclient64.dll + this = CClientRemoteStorage method

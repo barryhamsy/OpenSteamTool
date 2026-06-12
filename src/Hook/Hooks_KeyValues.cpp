@@ -99,7 +99,11 @@ namespace {
         return std::find(vec.begin(), vec.end(), ptr) != vec.end();
     }
 
-    thread_local AppId_t g_ParsedAppId = 0;
+    // g_ParsedAppId tracks the most recently parsed numeric key so cloud scrubbers
+    // know which AppID's subtree is currently being walked.  NOT thread_local —
+    // VDF parsing is sequential and thread_local would silently drop context when
+    // a new thread is used for a subtree lookup, causing the scrubbers to miss.
+    static AppId_t g_ParsedAppId = 0;
 
     KeyValues* WINAPI hkFindOrCreateKey(
         KeyValues* pThis, const char* setName, bool bCreate, KeyValues** ppUnknown)
@@ -111,6 +115,50 @@ namespace {
         if (isdigit(static_cast<unsigned char>(setName[0]))) {
             AppId_t id = static_cast<AppId_t>(std::strtoul(setName, nullptr, 10));
             if (id > 0) g_ParsedAppId = id;
+        }
+
+        // ════════════════════════════════════════════════════════════════
+        // CLOUD STATE SCRUBBERS — Surgical, name-keyed only
+        // ════════════════════════════════════════════════════════════════
+        // These ONLY fire when Steam explicitly looks up these specific
+        // keys by name during VDF parsing. No buffer scanning, no AppID
+        // guessing — safe by construction.  Result: stale cloud-error
+        // state in localconfig.vdf gets wiped on every parse, so the
+        // library badge can't render from cached errors.
+        //
+        // Scoped to spoofed AppIDs via g_ParsedAppId (which tracks the
+        // most recently-parsed numeric key in the current parse depth).
+        // For state keys at file-root that don't sit under an AppID node,
+        // we just always wipe — there's no real-game state at that level
+        // that would be affected.
+
+        // Per-app error strings (under "apps" > "<appid>" > ...)
+        if (keyQuery == "CloudSyncError" || keyQuery == "cloudsyncerror") {
+            KeyValues* pResult = oFindOrCreateKey(pThis, setName, bCreate, ppUnknown);
+            if (pResult && g_ParsedAppId > 0 && LuaConfig::HasDepot(g_ParsedAppId)) {
+                KV_SetString(pResult, "");
+            }
+            return pResult;
+        }
+        if (keyQuery == "last_sync_state" || keyQuery == "LastSyncState") {
+            KeyValues* pResult = oFindOrCreateKey(pThis, setName, bCreate, ppUnknown);
+            if (pResult && g_ParsedAppId > 0 && LuaConfig::HasDepot(g_ParsedAppId)) {
+                KV_SetString(pResult, "synchronized");
+            }
+            return pResult;
+        }
+
+        // Force cloud sync flag to "user-disabled" so Steam stops trying
+        // to upload to Valve in the first place.  Scoped to LuaConfig
+        // depots so real games are unaffected.
+        if (keyQuery == "CloudEnabled" || keyQuery == "EnableCloudSync" ||
+            keyQuery == "CloudSync" || keyQuery == "CloudDesktopSync")
+        {
+            if (g_ParsedAppId > 0 && LuaConfig::HasDepot(g_ParsedAppId)) {
+                KeyValues* pResult = oFindOrCreateKey(pThis, setName, bCreate, ppUnknown);
+                if (pResult) KV_SetString(pResult, "0");
+                return pResult;
+            }
         }
 
         KeyValues* pResult = oFindOrCreateKey(pThis, setName, bCreate, ppUnknown);
