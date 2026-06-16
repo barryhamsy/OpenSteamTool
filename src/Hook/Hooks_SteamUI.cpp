@@ -3,8 +3,10 @@
 #include "HookMacros.h"
 #include "dllmain.h"
 #include "steam_messages.pb.h"
-#include "Utils/VehCommon.h"
+#include "Utils/HookSupport/VehCommon.h"
 #include <mutex>
+#include <unordered_set>
+#include <vector>
 
 namespace
 {

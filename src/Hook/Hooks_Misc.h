@@ -27,4 +27,8 @@ namespace Hooks_Misc {
     // Get localized game name via GetAppDataFromAppInfo (cached).
     std::string GetGameNameByAppID(AppId_t appId);
 
+    // Returns true if Steam launched in offline mode or WantsOfflineMode=1
+    // in loginusers.vdf.  Set once at DLL install time, never changes.
+    bool IsOfflineMode();
+
 }

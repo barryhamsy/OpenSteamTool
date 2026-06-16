@@ -3,7 +3,7 @@
 #include "Hooks_Misc.h"
 #include "PendingAPICalls.h"
 #include "Steam/Callback.h"
-#include "Utils/Log.h"
+#include "Utils/Logging/Log.h"
 
 #include <type_traits>
 

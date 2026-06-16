@@ -1,14 +1,13 @@
 #include "Hooks_NetPacket.h"
-#include "Utils/ManifestClient.h"
+#include "Utils/SteamMetadata/ManifestClient.h"
 #include "Hooks_Misc.h"
 #include "HookMacros.h"
 #include "dllmain.h"
-#include "Utils/AppTicket.h"
-#include "Utils/Hash.h"
+#include "Utils/Tickets/AppTicket.h"
+#include "Utils/Support/FnvHash.h"
 #include <chrono>
 #include <future>
 #include <unordered_map>
-#include <vector>
 
 #include "steam_messages.pb.h"
 
@@ -17,20 +16,20 @@
 // ════════════════════════════════════════════════════════════════
 namespace {
 
-    constexpr uint32 kMaxBodySize = 8092;
-    constexpr uint32 kMaxHdrSize = 1024;
+    constexpr uint32 kMaxBodySize   = 8092;
+    constexpr uint32 kMaxHdrSize    = 1024;
     constexpr uint32 kMaxPacketSize = 8 + kMaxHdrSize + kMaxBodySize;
     constexpr int    kPacketPoolSize = 8;
 
     // ── Incoming (RecvPkt) packet pool ─────────────────────
     uint8  g_NewBody[kMaxBodySize];
-    uint32 g_cbNewBody = 0;
+    uint32 g_cbNewBody   = 0;
     uint8  g_NewHdr[kMaxHdrSize];
-    uint32 g_cbNewHdr = 0;
+    uint32 g_cbNewHdr    = 0;
     bool   g_NeedReplaceBody = false;
-    bool   g_NeedReplaceHdr = false;
+    bool   g_NeedReplaceHdr  = false;
     bool   g_ResizedInPlace = false;
-    uint32 g_NewBodySize = 0;
+    uint32 g_NewBodySize    = 0;
     uint8  g_RecvPacketPool[kPacketPoolSize][kMaxPacketSize];
     int    g_RecvPacketPoolIdx = 0;
 
@@ -38,8 +37,6 @@ namespace {
     uint8  g_SendNewBody[kMaxBodySize];
     uint32 g_cbSendNewBody = 0;
     bool   g_NeedReplaceSend = false;
-    AppId_t  g_PendingCloudChangelistAppId = 0;
-    uint64_t g_PendingCloudChangelistChangeNum = 0;
     uint8  g_SendPacketPool[kPacketPoolSize][kMaxPacketSize];
     int    g_SendPacketPoolIdx = 0;
 
@@ -53,8 +50,8 @@ namespace {
 
     // ── Packet layout ──────────────────────────────────────────
     inline bool UnpackRaw(const uint8* data, uint32 size,
-        EMsg& eMsg, const uint8*& pHdr, uint32& cbHdr,
-        const uint8*& pBody, uint32& cbBody)
+                          EMsg& eMsg, const uint8*& pHdr, uint32& cbHdr,
+                          const uint8*& pBody, uint32& cbBody)
     {
         if (!data || size < sizeof(MsgHdr)) {
         fail:
@@ -68,29 +65,28 @@ namespace {
         const MsgHdr* hdr = reinterpret_cast<const MsgHdr*>(data);
         if (!(hdr->eMsg & kMsgHdrProtoFlag)) goto fail;
 
-        eMsg = static_cast<EMsg>(hdr->eMsg & ~kMsgHdrProtoFlag);
+        eMsg  = static_cast<EMsg>(hdr->eMsg & ~kMsgHdrProtoFlag);
         cbHdr = hdr->headerLength;
         uint32 off = sizeof(MsgHdr) + cbHdr;
         if (off > size) goto fail;
-        pHdr = data + sizeof(MsgHdr);
-        pBody = data + off;
+        pHdr   = data + sizeof(MsgHdr);
+        pBody  = data + off;
         cbBody = size - off;
         return true;
     }
 
     // ── Incoming: replace header and/or body (ring-buffer pool) ──
     inline void ReplaceRecvPacket(CNetPacket* p,
-        const uint8* pNewHdr, uint32 cbNewHdr,
-        const uint8* pNewBody, uint32 cbNewBody)
+                                  const uint8* pNewHdr, uint32 cbNewHdr,
+                                  const uint8* pNewBody, uint32 cbNewBody)
     {
-        // FIX: Use cbNewHdr instead of cbHdr
         uint32 newSize = sizeof(MsgHdr) + cbNewHdr + cbNewBody;
         if (newSize > sizeof(g_RecvPacketPool[0])) return;
 
         uint8* buf = g_RecvPacketPool[g_RecvPacketPoolIdx];
         const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(p->m_pubData);
         MsgHdr* out = reinterpret_cast<MsgHdr*>(buf);
-        out->eMsg = orig->eMsg;
+        out->eMsg         = orig->eMsg;
         out->headerLength = cbNewHdr;
         memcpy(buf + sizeof(MsgHdr), pNewHdr, cbNewHdr);
         if (cbNewBody)
@@ -103,9 +99,9 @@ namespace {
 
     // ── Outgoing: assemble modified packet (ring-buffer pool) ────
     inline uint8* ReplaceSendPacket(const uint8* pubData,
-        uint32 cbHdr, const uint8* pHdr,
-        const uint8* pNewBody, uint32 cbNewBody,
-        uint32* pNewSize)
+                                    uint32 cbHdr, const uint8* pHdr,
+                                    const uint8* pNewBody, uint32 cbNewBody,
+                                    uint32* pNewSize)
     {
         *pNewSize = sizeof(MsgHdr) + cbHdr + cbNewBody;
         if (*pNewSize > sizeof(g_SendPacketPool[0])) return nullptr;
@@ -113,7 +109,7 @@ namespace {
         uint8* buf = g_SendPacketPool[g_SendPacketPoolIdx];
         const MsgHdr* orig = reinterpret_cast<const MsgHdr*>(pubData);
         MsgHdr* out = reinterpret_cast<MsgHdr*>(buf);
-        out->eMsg = orig->eMsg;
+        out->eMsg         = orig->eMsg;
         out->headerLength = cbHdr;
         memcpy(buf + sizeof(MsgHdr), pHdr, cbHdr);
         memcpy(buf + sizeof(MsgHdr) + cbHdr, pNewBody, cbNewBody);
@@ -125,28 +121,6 @@ namespace {
     constexpr uint32 HASH_JOB_NotifyRunningApps = Fnv1aHash("FamilyGroupsClient.NotifyRunningApps#1");
     constexpr uint32 HASH_JOB_GetUserStats = Fnv1aHash("Player.GetUserStats#1");
     constexpr uint32 HASH_JOB_GetManifestRequestCode = Fnv1aHash("ContentServerDirectory.GetManifestRequestCode#1");
-    constexpr uint32 HASH_JOB_GetAppFileChangelist = Fnv1aHash("Cloud.GetAppFileChangelist#1");
-
-    // Helper to encode integers into Protobuf Varints
-    std::vector<uint8_t> EncodeVarintPadded(uint32_t value, size_t padToLength = 0) {
-        std::vector<uint8_t> res;
-        while (value >= 0x80) {
-            res.push_back(static_cast<uint8_t>((value & 0x7F) | 0x80));
-            value >>= 7;
-        }
-        res.push_back(static_cast<uint8_t>(value));
-
-        // If we are replacing, we MUST maintain exact byte length
-        // We do this by padding with 0x80 (Protobuf continuation bit for 0)
-        if (padToLength > 0 && res.size() < padToLength) {
-            res.back() |= 0x80; // convert last byte to a continuation byte
-            while (res.size() < padToLength - 1) {
-                res.push_back(0x80);
-            }
-            res.push_back(0x00); // Terminate the varint
-        }
-        return res;
-    }
 
 } // anonymous namespace
 
@@ -186,22 +160,20 @@ namespace Hooks_NetPacket_AccessToken {
                 uint64_t token = LuaConfig::GetAccessToken(app.appid());
                 if (token) {
                     LOG_PICS_DEBUG("CMsgClientPICSProductInfoRequest: inject appid={}: {} -> {}", app.appid(),
-                        app.has_access_token() ? std::to_string(app.access_token()) : "absent",
-                        token);
+                               app.has_access_token() ? std::to_string(app.access_token()) : "absent",
+                               token);
                     app.set_access_token(token);
                     ++injected;
-                }
-                else {
+                } else {
                     LOG_PICS_WARN("CMsgClientPICSProductInfoRequest: skip appid={}: in depot, no token configured", app.appid());
                     ++noToken;
                 }
-            }
-            else {
+            } else {
                 ++notAddAppId;
             }
         }
         LOG_PICS_DEBUG("CMsgClientPICSProductInfoRequest: injected={} no_token={} not_in_add_appid={} total={}",
-            injected, noToken, notAddAppId, req.apps_size());
+                   injected, noToken, notAddAppId, req.apps_size());
 
         g_cbSendNewBody = static_cast<uint32>(req.ByteSizeLong());
         if (g_cbSendNewBody > kMaxBodySize) {
@@ -235,7 +207,7 @@ namespace Hooks_NetPacket_UserStats {
 
     // ── Send: CPlayer_GetUserStats_Request (eMsg 151) ──────────
     bool HandleSend_GetUserStats(const uint8* pBody, uint32 cbBody,
-        const uint8* pHdr, uint32 cbHdr)
+                                 const uint8* pHdr, uint32 cbHdr)
     {
 
         CPlayer_GetUserStats_Request req;
@@ -249,7 +221,7 @@ namespace Hooks_NetPacket_UserStats {
         }
 
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: original body:\n{}", req.DebugString());
-
+        
         AppId_t appId = req.appid();
         bool hasShaSchema = req.has_sha_schema() && !req.sha_schema().empty();
 
@@ -286,11 +258,11 @@ namespace Hooks_NetPacket_UserStats {
     // ── Recv: CPlayer_GetUserStats_Response (eMsg 147) ─────────
     //     Header: set eresult=OK.  Body: strip stats (field 4).
     void HandleRecv_GetUserStatsResponse(const uint8* pHdr, uint32 cbHdr,
-        const uint8* pBody, uint32 cbBody)
+                                    const uint8* pBody, uint32 cbBody)
     {
         // Header: set eresult=OK
         CMsgProtoBufHeader hdrMsg;
-        if (!hdrMsg.ParseFromArray(pHdr, cbHdr)) {
+        if (!hdrMsg.ParseFromArray(pHdr, cbHdr)){
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to ParseFromArray original header");
             return;
         }
@@ -319,7 +291,7 @@ namespace Hooks_NetPacket_UserStats {
 
         // Body: strip stats (only if appid was matched and is in our config)
         CPlayer_GetUserStats_Response resp;
-        if (!resp.ParseFromArray(pBody, cbBody)) {
+        if (!resp.ParseFromArray(pBody, cbBody)){
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to ParseFromArray original response");
             return;
         }
@@ -332,7 +304,7 @@ namespace Hooks_NetPacket_UserStats {
 
         resp.clear_stats();
         g_NewBodySize = static_cast<uint32>(resp.ByteSizeLong());
-        if (!resp.SerializeToArray(const_cast<uint8*>(pBody), cbBody)) {
+        if (!resp.SerializeToArray(const_cast<uint8*>(pBody), cbBody)){
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to SerializeToArray modified response");
             return;
         }
@@ -386,7 +358,7 @@ namespace Hooks_NetPacket_UserStats {
         if (!resp.ParseFromArray(pBody, cbBody))
             return false;
         LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: original body:\n{}", resp.DebugString());
-        if (!resp.has_game_id() || !LuaConfig::HasDepot(static_cast<AppId_t>(resp.game_id()))) {
+        if(!resp.has_game_id() || !LuaConfig::HasDepot(static_cast<AppId_t>(resp.game_id()))) {
             LOG_ACHIEVEMENT_DEBUG("ClientGetUserStats response: no modification needed");
             return false;
         }
@@ -426,11 +398,11 @@ namespace Hooks_NetPacket_ETicket {
         if (resp.eresult() == k_EResultOK) return;
         if (!LuaConfig::HasDepot(resp.app_id())) return;
 
-        auto ticket = AppTicket::GetEncryptedTicketFromRegistry(resp.app_id());
+        auto ticket = AppTicket::GetEncryptedTicketFromCredentialStore(resp.app_id());
         if (ticket.empty()) return;
 
         if (!resp.mutable_encrypted_app_ticket()->ParseFromArray(
-            ticket.data(), static_cast<int>(ticket.size()))) {
+                ticket.data(), static_cast<int>(ticket.size()))) {
             LOG_NETPACKET_WARN("ClientRequestEncryptedAppTicketResponse: failed to ParseFromArray EncryptedAppTicket");
             return;
         }
@@ -446,7 +418,7 @@ namespace Hooks_NetPacket_ETicket {
             LOG_NETPACKET_WARN("ClientRequestEncryptedAppTicketResponse: failed to SerializeToArray modified response");
             return;
         }
-
+        
         LOG_NETPACKET_DEBUG("ClientRequestEncryptedAppTicketResponse: modified body:\n{}", resp.DebugString());
 
         g_cbNewBody = static_cast<uint32>(encSize);
@@ -489,7 +461,7 @@ namespace Hooks_NetPacket_Manifest {
     constexpr uint32 kMaxWaitSeconds = 12;
 
     bool HandleSend(const uint8* pBody, uint32 cbBody,
-        const uint8* pHdr, uint32 cbHdr)
+                    const uint8* pHdr, uint32 cbHdr)
     {
         CContentServerDirectory_GetManifestRequestCode_Request req;
         if (!req.ParseFromArray(pBody, cbBody)) {
@@ -505,13 +477,13 @@ namespace Hooks_NetPacket_Manifest {
             return false;
         }
 
-        uint64 jobId = hdr.jobid_source();
+        uint64 jobId       = hdr.jobid_source();
         uint64 manifestGid = req.manifest_id();
-        uint32 depotId = req.depot_id();
-        uint32 appId = req.has_app_id() ? req.app_id() : 0;
+        uint32 depotId     = req.depot_id();
+        uint32 appId       = req.has_app_id() ? req.app_id() : 0;
 
         LOG_MANIFEST_DEBUG("GetManifestRequestCode send: depot={} gid={} jobid={} app_id={}",
-            depotId, manifestGid, jobId, appId);
+                            depotId, manifestGid, jobId, appId);
 
         auto task = std::async(std::launch::async,
             [manifestGid, depotId, appId]() -> uint64 {
@@ -529,10 +501,10 @@ namespace Hooks_NetPacket_Manifest {
     }
 
     void HandleRecv(const uint8* pBody, uint32 cbBody,
-        const uint8* pHdr, uint32 cbHdr)
+                    const uint8* pHdr, uint32 cbHdr)
     {
         CMsgProtoBufHeader hdr;
-        if (!hdr.ParseFromArray(pHdr, cbHdr)) {
+        if (!hdr.ParseFromArray(pHdr, cbHdr)){
             LOG_MANIFEST_WARN("GetManifestRequestCode recv: failed to ParseFromArray original header");
             return;
         }
@@ -561,14 +533,14 @@ namespace Hooks_NetPacket_Manifest {
         }
 
         LOG_MANIFEST_DEBUG("GetManifestRequestCode recv: injecting code={} for jobid={}",
-            code, jobId);
+                            code, jobId);
 
         // Header: set eresult=OK
         hdr.set_eresult(static_cast<int32_t>(k_EResultOK));
         g_cbNewHdr = static_cast<uint32>(hdr.ByteSizeLong());
-        if (g_cbNewHdr > kMaxHdrSize || !hdr.SerializeToArray(g_NewHdr, kMaxHdrSize)) {
+        if (g_cbNewHdr > kMaxHdrSize || !hdr.SerializeToArray(g_NewHdr, kMaxHdrSize)){
             LOG_MANIFEST_WARN("GetManifestRequestCode recv: failed to SerializeToArray modified header,"
-                "g_cbNewHdr: {}, kMaxHdrSize: {}", g_cbNewHdr, kMaxHdrSize);
+                    "g_cbNewHdr: {}, kMaxHdrSize: {}", g_cbNewHdr, kMaxHdrSize);
             return;
         }
         g_NeedReplaceHdr = true;
@@ -578,7 +550,7 @@ namespace Hooks_NetPacket_Manifest {
         resp.set_manifest_request_code(code);
 
         g_cbNewBody = static_cast<uint32>(resp.ByteSizeLong());
-        if (g_cbNewBody > kMaxBodySize || !resp.SerializeToArray(g_NewBody, kMaxBodySize)) {
+        if (g_cbNewBody > kMaxBodySize || !resp.SerializeToArray(g_NewBody, kMaxBodySize)){
             LOG_MANIFEST_WARN("GetManifestRequestCode recv: failed to SerializeToArray modified body,"
                 "g_cbNewBody:{}, kMaxBodySize:{}", g_cbNewBody, kMaxBodySize);
             return;
@@ -607,15 +579,15 @@ namespace Hooks_NetPacket_RichPresence {
 
     // Most recent self-PersonaState bytes captured from a real server push.
     // Reused as the template every game launch.
-    uint8   g_SelfHdr[kMaxHdrSize];
-    uint32  g_cbSelfHdr = 0;
+    uint8   g_SelfHdr [kMaxHdrSize];
+    uint32  g_cbSelfHdr      = 0;
     uint8   g_SelfBody[kMaxBodySize];
-    uint32  g_cbSelfBody = 0;
+    uint32  g_cbSelfBody     = 0;
     bool    g_HaveSelfCached = false;
 
     // Manufactured PersonaState packet (eMsg 766) ready to inject.
     uint8   g_InjectPkt[kMaxPacketSize];
-    uint32  g_cbInjectPkt = 0;
+    uint32  g_cbInjectPkt   = 0;
     bool    g_InjectPending = false;
 
     // Rich presence KVs per AppId, captured from outbound
@@ -628,7 +600,7 @@ namespace Hooks_NetPacket_RichPresence {
     // starts a struct, 0x01 a string KV, 0x08 ends a struct.  String KVs
     // are null-terminated key + null-terminated value.
     static void ExtractStringKVs(const uint8* data, uint32 size,
-        std::vector<std::pair<std::string, std::string>>& out)
+                                 std::vector<std::pair<std::string, std::string>>& out)
     {
         uint32 pos = 0;
         int depth = 0;
@@ -639,7 +611,7 @@ namespace Hooks_NetPacket_RichPresence {
             s.assign(reinterpret_cast<const char*>(data + start), pos - start);
             ++pos;
             return true;
-            };
+        };
         while (pos < size) {
             uint8 type = data[pos++];
             if (type == 0x08) {
@@ -650,13 +622,11 @@ namespace Hooks_NetPacket_RichPresence {
                 std::string name;
                 if (!readCStr(name)) return;
                 ++depth;
-            }
-            else if (type == 0x01) {
+            } else if (type == 0x01) {
                 std::string key, value;
                 if (!readCStr(key) || !readCStr(value)) return;
                 out.emplace_back(std::move(key), std::move(value));
-            }
-            else {
+            } else {
                 return;
             }
         }
@@ -668,8 +638,8 @@ namespace Hooks_NetPacket_RichPresence {
     // m_mapRichPresence, which is rebuilt from rich_presence() whenever
     // that bit is set.
     static void ApplyGameFields(CMsgClientPersonaState& msg,
-        CMsgClientPersonaState::Friend* entry,
-        AppId_t appid)
+                                CMsgClientPersonaState::Friend* entry,
+                                AppId_t appid)
     {
         // EClientPersonaStateFlag::k_EClientPersonaStateFlagRichPresence
         constexpr uint32 kStatusFlagRichPresence = 0x1000;
@@ -689,12 +659,10 @@ namespace Hooks_NetPacket_RichPresence {
                     kv->set_value(v);
                 }
                 msg.set_status_flags(msg.status_flags() | kStatusFlagRichPresence);
-            }
-            else {
+            } else {
                 msg.set_status_flags(msg.status_flags() & ~kStatusFlagRichPresence);
             }
-        }
-        else {
+        } else {
             entry->clear_game_played_app_id();
             entry->clear_gameid();
             entry->clear_game_name();
@@ -723,9 +691,9 @@ namespace Hooks_NetPacket_RichPresence {
 
         ApplyGameFields(msg, entry, appid);
 
-        uint32 hdrSize = g_cbSelfHdr;
+        uint32 hdrSize  = g_cbSelfHdr;
         uint32 bodySize = static_cast<uint32>(msg.ByteSizeLong());
-        uint32 total = sizeof(MsgHdr) + hdrSize + bodySize;
+        uint32 total    = sizeof(MsgHdr) + hdrSize + bodySize;
         if (total > sizeof(g_InjectPkt) || bodySize > kMaxBodySize) {
             LOG_RICHPRESENCE_WARN("Inject packet too large ({} bytes)", total);
             return false;
@@ -758,7 +726,7 @@ namespace Hooks_NetPacket_RichPresence {
         auto& kvs = g_RPKvsByAppId[g_PlayingAppId];
         kvs.clear();
         ExtractStringKVs(reinterpret_cast<const uint8*>(kv.data()),
-            static_cast<uint32>(kv.size()), kvs);
+                         static_cast<uint32>(kv.size()), kvs);
         LOG_RICHPRESENCE_DEBUG("RP upload appid={}: kv_bytes={} extracted={} pairs",
             g_PlayingAppId, kv.size(), kvs.size());
 
@@ -797,13 +765,11 @@ namespace Hooks_NetPacket_RichPresence {
         if (newTracked != 0) {
             LOG_RICHPRESENCE_INFO("Tracking topmost appid {}", newTracked);
             if (BuildInject(newTracked)) g_InjectPending = true;
-        }
-        else if (topmost == 0) {
+        } else if (topmost == 0) {
             // Stack went empty — inject a clear so the cache reverts.
             LOG_RICHPRESENCE_DEBUG("GamesPlayed empty, scheduling cache clear");
             if (BuildInject(0)) g_InjectPending = true;
-        }
-        else {
+        } else {
             // Topmost is owned (or -onlinefix); let the server's broadcast
             // paint it.  Skipping the clear-inject here avoids a brief
             // "Online" flicker between our drop and the server's push.
@@ -834,10 +800,10 @@ namespace Hooks_NetPacket_RichPresence {
             msg.status_flags(), msg.friends_size());
 
         if (cbHdr <= sizeof(g_SelfHdr) && cbBody <= sizeof(g_SelfBody)) {
-            memcpy(g_SelfHdr, pHdr, cbHdr);
+            memcpy(g_SelfHdr,  pHdr,  cbHdr);
             memcpy(g_SelfBody, pBody, cbBody);
-            g_cbSelfHdr = cbHdr;
-            g_cbSelfBody = cbBody;
+            g_cbSelfHdr      = cbHdr;
+            g_cbSelfBody     = cbBody;
             g_HaveSelfCached = true;
         }
 
@@ -860,7 +826,7 @@ namespace Hooks_NetPacket_RichPresence {
     // Deliver the pending manufactured PersonaState by borrowing the
     // carrier's data pointer for one oRecvPkt call, then restore.
     void TryInject(void* pThis, CNetPacket* pCarrier,
-        bool (*invokeOriginal)(void*, CNetPacket*))
+                   bool (*invokeOriginal)(void*, CNetPacket*))
     {
         if (!g_InjectPending || g_cbInjectPkt == 0) return;
         g_InjectPending = false;
@@ -881,22 +847,16 @@ namespace Hooks_NetPacket_RichPresence {
 // ════════════════════════════════════════════════════════════════
 //  Hooks_NetPacket_OnlineFix
 //
-//  Two spoof paths:
-//   (A) Engine path — game launched with -onlinefix. SpawnProcess
-//       (Hooks_Misc) already rewrote pGameID to 480, so game_id
-//       arrives here as 480. We only fill game_extra_info with the
-//       real localized name. ResolveAppId() returns the real appid
-//       via g_OnlineFixRealAppId.
-//   (B) Network-only path — depot-configured game launched WITHOUT
-//       -onlinefix. SpawnProcess did NOT touch it, so game_id is the
-//       real appid. We rewrite the low 32 bits to 480 on the outgoing
-//       broadcast and inject the real name, so friends see the title
-//       while the server still treats it as Spacewar.
+//  Outgoing: CMsgClientGamesPlayed (eMsg 742 / 5410)
+//
+//  When a game launched with -onlinefix reports appid 480, replace
+//  game_extra_info with the real game's localized name so friends
+//  see the correct title.
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_OnlineFix {
 
     bool HandleSend(const uint8* pBody, uint32 cbBody,
-        const uint8* pHdr, uint32 cbHdr)
+                    const uint8* pHdr, uint32 cbHdr)
     {
         CMsgClientGamesPlayed msg;
         if (!msg.ParseFromArray(pBody, cbBody)) {
@@ -905,8 +865,6 @@ namespace Hooks_NetPacket_OnlineFix {
         }
         LOG_ONLINEFIX_DEBUG("OnlineFix: original body:\n{}", msg.DebugString());
 
-        // Track Rich Presence locally BEFORE we manipulate the AppIDs,
-        // so g_PlayingAppId sees the true (pre-spoof) topmost appid.
         Hooks_NetPacket_RichPresence::TrackSend(msg, pHdr, cbHdr);
 
         bool patched = false;
@@ -914,8 +872,9 @@ namespace Hooks_NetPacket_OnlineFix {
             auto* game = msg.mutable_games_played(i);
             AppId_t appid = static_cast<AppId_t>(game->game_id() & UINT32_MAX);
 
+            // SpawnProcess rewrites pGameID to 480, so game_id is already 480.
+            // Fill game_extra_info with the real game name.
             if (appid == kOnlineFixAppId) {
-                // ── Path A: already 480 (SpawnProcess engine spoof) ──
                 AppId_t realAppId = Hooks_Misc::ResolveAppId();
                 if (realAppId && LuaConfig::HasDepot(realAppId)) {
                     std::string name = Hooks_Misc::GetGameNameByAppID(realAppId);
@@ -926,25 +885,6 @@ namespace Hooks_NetPacket_OnlineFix {
                             name, realAppId);
                     }
                 }
-            }
-            else if (LuaConfig::HasDepot(appid)) {
-                // ── Path B: depot game NOT launched via -onlinefix ──
-                // SpawnProcess left game_id at the real appid; rewrite the
-                // outgoing broadcast to 480 and inject the real name so
-                // friends see the title without the server seeing it.
-                std::string name = Hooks_Misc::GetGameNameByAppID(appid);
-
-                uint64 prevId = game->game_id();
-                uint64 newId = (prevId & ~static_cast<uint64>(UINT32_MAX))
-                    | kOnlineFixAppId;
-                game->set_game_id(newId);
-
-                if (!name.empty())
-                    game->set_game_extra_info(name);
-
-                patched = true;
-                LOG_ONLINEFIX_INFO("Network Spoof: broadcast AppID {} -> 480 ('{}')",
-                    appid, name);
             }
         }
 
@@ -973,8 +913,8 @@ namespace Hooks_NetPacket_OnlineFix {
 namespace {
 
     bool SendServiceJob(const char* targetJobName,
-        const uint8* pBody, uint32 cbBody,
-        const uint8* pHdr, uint32 cbHdr)
+                        const uint8* pBody, uint32 cbBody,
+                        const uint8* pHdr, uint32 cbHdr)
     {
         LOG_NETPACKET_DEBUG("Send target_job_name: {}", targetJobName);
         switch (Fnv1aHash(targetJobName)) {
@@ -985,102 +925,25 @@ namespace {
         case HASH_JOB_GetManifestRequestCode:
             return Hooks_NetPacket_Manifest::HandleSend(pBody, cbBody, pHdr, cbHdr);
 
-        case HASH_JOB_GetAppFileChangelist:
-            // SendJob already extracted the AppID above; nothing more needed here.
-            return false;
-
-            // ---- add new 151 service methods here ----
+        // ---- add new 151 service methods here ----
         }
         return false;
     }
 
     void SendJob(EMsg eMsg, const uint8* pBody, uint32 cbBody,
-        const uint8* pHdr, uint32 cbHdr)
+                 const uint8* pHdr, uint32 cbHdr)
     {
         g_NeedReplaceSend = false;
 
         LOG_NETPACKET_DEBUG("Send eMsg {}({}) (cbBody={}, cbHdr={})",
-            MsgName(eMsg), static_cast<uint32>(eMsg), cbBody, cbHdr);
-
-        // ============================================================
-        //  THE CLOUD REDIRECT NETWORK EMULATOR (P2: Proxy AppID Zero)
-        // ============================================================
-        // Steam Cloud runs over two paths in modern Steam:
-        //   1. Legacy UFS eMsgs 5200-5300 (some old client paths)
-        //   2. ServiceMethod eMsg 151 with target_job_name containing "Cloud"
-        //      e.g. "CloudClient.AppCloudStateChanged#1"
-        // Both: find the active AppID varint in the body and zero it.
-        // Valve drops requests for AppID 0 without generating UI errors.
-        //
-        // NOTE: Library-time badge = CACHED localconfig.vdf state, not
-        // fresh network activity.  KV scrubbers handle that path.
-        auto TryZeroAppId = [&](AppId_t targetApp) -> bool {
-            if (targetApp == 0 || !LuaConfig::HasDepot(targetApp)) return false;
-            if (cbBody == 0 || cbBody > kMaxBodySize) return false;
-            std::vector<uint8_t> searchSig = EncodeVarintPadded(targetApp);
-            std::vector<uint8_t> replaceSig = EncodeVarintPadded(0, searchSig.size());
-            memcpy(g_SendNewBody, pBody, cbBody);
-            for (uint32 i = 0; i + searchSig.size() <= cbBody; i++) {
-                if (memcmp(g_SendNewBody + i, searchSig.data(), searchSig.size()) == 0) {
-                    memcpy(g_SendNewBody + i, replaceSig.data(), replaceSig.size());
-                    g_cbSendNewBody = cbBody;
-                    g_NeedReplaceSend = true;
-                    return true;
-                }
-            }
-            return false;
-            };
-
-        // Legacy UFS eMsgs
-        uint32 eMsgInt = static_cast<uint32>(eMsg);
-        if (eMsgInt >= 5200 && eMsgInt <= 5300) {
-            if (TryZeroAppId(Hooks_Misc::ResolveAppId())) {
-                LOG_NETPACKET_DEBUG("CloudRedirect: Intercepted legacy UFS eMsg {}, zeroed AppID", eMsgInt);
-                return;
-            }
-        }
+                        MsgName(eMsg), static_cast<uint32>(eMsg), cbBody, cbHdr);
 
         switch (eMsg) {
 
         case k_EMsgServiceMethodCallFromClient: {   // 151
             CMsgProtoBufHeader hdr;
             if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_target_job_name()) {
-                const char* jobName = hdr.target_job_name().c_str();
-                // Modern Steam Cloud calls go via ServiceMethod with job names starting
-                // with "CloudClient." or "Cloud".  Zero the AppID so Valve drops the
-                // request silently instead of writing a cloud-error state back.
-                // Capture GetAppFileChangelist AppID before TryZeroAppId short-circuits.
-                if (strcmp(jobName, "Cloud.GetAppFileChangelist#1") == 0 &&
-                    cbBody >= 2 && pBody[0] == 0x08) {
-                    uint32_t _id = 0; uint32 _sh = 0;
-                    for (uint32 _i = 1; _i < cbBody && _i < 6; _i++) {
-                        uint8_t _b = pBody[_i]; _id |= (uint32_t)(_b & 0x7F) << _sh;
-                        _sh += 7; if (!(_b & 0x80)) break;
-                    }
-                    if (_id >= 1000 && LuaConfig::HasDepot(static_cast<AppId_t>(_id))) {
-                        g_PendingCloudChangelistAppId = static_cast<AppId_t>(_id);
-                        // Extract synced_change_number from field 2 (tag 0x10)
-                        for (uint32 _k = 1; _k + 1 < cbBody; _k++) {
-                            if (pBody[_k] == 0x10) {
-                                uint64_t _cn = 0; uint32 _cs = 0;
-                                for (uint32 _m = _k + 1; _m < cbBody && _m < _k + 11; _m++) {
-                                    uint8_t _c = pBody[_m];
-                                    _cn |= (uint64_t)(_c & 0x7F) << _cs;
-                                    _cs += 7; if (!(_c & 0x80)) break;
-                                }
-                                g_PendingCloudChangelistChangeNum = _cn;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (strncmp(jobName, "Cloud", 5) == 0) {
-                    if (TryZeroAppId(Hooks_Misc::ResolveAppId())) {
-                        LOG_NETPACKET_DEBUG("CloudRedirect: Intercepted cloud ServiceMethod {}, zeroed AppID", jobName);
-                        return;
-                    }
-                }
-                g_NeedReplaceSend = SendServiceJob(jobName, pBody, cbBody, pHdr, cbHdr);
+                g_NeedReplaceSend = SendServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
             }
             return;
         }
@@ -1108,12 +971,12 @@ namespace {
     }
 
     void RecvServiceJob(const char* targetJobName,
-        const uint8* pBody, uint32 cbBody,
-        const uint8* pHdr, uint32 cbHdr)
+                        const uint8* pBody, uint32 cbBody,
+                        const uint8* pHdr, uint32 cbHdr)
     {
         LOG_NETPACKET_DEBUG("Recv target_job_name: {}", targetJobName);
         g_NeedReplaceBody = false;
-        g_NeedReplaceHdr = false;
+        g_NeedReplaceHdr  = false;
 
         switch (Fnv1aHash(targetJobName)) {
 
@@ -1129,46 +992,22 @@ namespace {
             Hooks_NetPacket_Manifest::HandleRecv(pBody, cbBody, pHdr, cbHdr);
             return;
 
-
-        case HASH_JOB_GetAppFileChangelist: {
-            // Echo synced_change_number back as current_change_number with no files.
-            // This tells Steam "server matches your last sync, nothing changed" -> Up to date.
-            // Using 0xFFFFFFFF caused a download-retry loop; echoing the request value is correct.
-            AppId_t pendingId = g_PendingCloudChangelistAppId;
-            uint64_t changeNum = g_PendingCloudChangelistChangeNum;
-            g_PendingCloudChangelistAppId = 0;
-            g_PendingCloudChangelistChangeNum = 0;
-            if (pendingId != 0) {
-                uint8 resp[12] = {};
-                uint32 rlen = 0;
-                resp[rlen++] = 0x08; // field 1 (current_change_number), wire type varint
-                uint64_t cn = changeNum > 0 ? changeNum : 1;
-                while (cn > 0x7F) { resp[rlen++] = (uint8)((cn & 0x7F) | 0x80); cn >>= 7; }
-                resp[rlen++] = (uint8)cn;
-                memcpy(g_NewBody, resp, rlen);
-                g_cbNewBody = rlen;
-                g_NeedReplaceBody = true;
-                LOG_NETPACKET_DEBUG("CloudSync: empty changelist AppId={} changeNum={}", pendingId, changeNum);
-            }
-            return;
-        }
-
-                                          // ---- add new 147 service methods here ----
+        // ---- add new 147 service methods here ----
         }
     }
 
     void RecvJob(EMsg eMsg, const uint8* pBody, uint32 cbBody,
-        const uint8* pHdr, uint32 cbHdr)
+                 const uint8* pHdr, uint32 cbHdr)
     {
         g_NeedReplaceBody = false;
-        g_NeedReplaceHdr = false;
+        g_NeedReplaceHdr  = false;
 
-        if (eMsg == k_EMsgMulti) {
+        if(eMsg == k_EMsgMulti) {
             LOG_NETPACKET_TRACE("Received k_EMsgMulti, skipping dispatch");
             return;
         }
         LOG_NETPACKET_DEBUG("Recv eMsg {}({}) (cbBody={}, cbHdr={})",
-            MsgName(eMsg), static_cast<uint32>(eMsg), cbBody, cbHdr);
+                        MsgName(eMsg), static_cast<uint32>(eMsg), cbBody, cbHdr);
 
         switch (eMsg) {
 
@@ -1178,6 +1017,11 @@ namespace {
                 RecvServiceJob(hdr.target_job_name().c_str(), pBody, cbBody, pHdr, cbHdr);
             return;
         }
+
+        // migrated to IPC Layer Hooks_IPC_ISteamUser::GetEncryptedAppTicketResponse
+        // case k_EMsgClientRequestEncryptedAppTicketResponse:     // 5527
+        //     Hooks_NetPacket_ETicket::HandleEncryptedAppTicketResponse(pBody, cbBody);
+        //     return;
 
         case k_EMsgClientGetUserStatsResponse:     // 819
             g_NeedReplaceBody = Hooks_NetPacket_UserStats::HandleRecv_ClientGetUserStatsResponse(
@@ -1202,14 +1046,14 @@ namespace {
     // ════════════════════════════════════════════════════════════
 
     HOOK_FUNC(BBuildAndAsyncSendFrame, bool,
-        void* pObject, EWebSocketOpCode eWebSocketOpCode,
-        uint8* pubData, uint32 cubData)
+              void* pObject, EWebSocketOpCode eWebSocketOpCode,
+              uint8* pubData, uint32 cubData)
     {
         if (eWebSocketOpCode != k_eWebSocketOpCode_Binary)
             return oBBuildAndAsyncSendFrame(pObject, eWebSocketOpCode, pubData, cubData);
 
         EMsg eMsg;
-        const uint8* pHdr, * pBody;
+        const uint8 *pHdr, *pBody;
         uint32 cbHdr, cbBody;
         bool result;
         if (UnpackRaw(pubData, cubData, eMsg, pHdr, cbHdr, pBody, cbBody)) {
@@ -1218,16 +1062,14 @@ namespace {
             if (g_NeedReplaceSend) {
                 uint32 newSize = 0;
                 uint8* buf = ReplaceSendPacket(pubData, cbHdr, pHdr,
-                    g_SendNewBody, g_cbSendNewBody, &newSize);
+                                               g_SendNewBody, g_cbSendNewBody, &newSize);
                 result = buf
                     ? oBBuildAndAsyncSendFrame(pObject, eWebSocketOpCode, buf, newSize)
                     : oBBuildAndAsyncSendFrame(pObject, eWebSocketOpCode, pubData, cubData);
-            }
-            else {
+            } else {
                 result = oBBuildAndAsyncSendFrame(pObject, eWebSocketOpCode, pubData, cubData);
             }
-        }
-        else {
+        } else {
             result = oBBuildAndAsyncSendFrame(pObject, eWebSocketOpCode, pubData, cubData);
         }
 
@@ -1241,10 +1083,10 @@ namespace {
             [](void* pT, CNetPacket* pP) -> bool { return oRecvPkt(pT, pP) != nullptr; });
 
         EMsg eMsg;
-        const uint8* pBody, * pHdr;
+        const uint8 *pBody, *pHdr;
         uint32 cbBody, cbHdr;
         if (UnpackRaw(pPacket->m_pubData, pPacket->m_cubData,
-            eMsg, pHdr, cbHdr, pBody, cbBody)) {
+                     eMsg, pHdr, cbHdr, pBody, cbBody)) {
             g_ResizedInPlace = false;
             RecvJob(eMsg, pBody, cbBody, pHdr, cbHdr);
 
@@ -1253,14 +1095,12 @@ namespace {
                 ReplaceRecvPacket(pPacket,
                     g_NewHdr, g_cbNewHdr,
                     pBody, g_NewBodySize);
-            }
-            else if (g_ResizedInPlace) {
+            } else if (g_ResizedInPlace) {
                 pPacket->m_cubData = sizeof(MsgHdr) + cbHdr + g_NewBodySize;
-            }
-            else if (g_NeedReplaceHdr || g_NeedReplaceBody) {
+            } else if (g_NeedReplaceHdr || g_NeedReplaceBody) {
                 ReplaceRecvPacket(pPacket,
-                    g_NeedReplaceHdr ? g_NewHdr : pHdr,
-                    g_NeedReplaceHdr ? g_cbNewHdr : cbHdr,
+                    g_NeedReplaceHdr  ? g_NewHdr  : pHdr,
+                    g_NeedReplaceHdr  ? g_cbNewHdr : cbHdr,
                     g_NeedReplaceBody ? g_NewBody : pBody,
                     g_NeedReplaceBody ? g_cbNewBody : cbBody);
             }

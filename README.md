@@ -1,12 +1,33 @@
-# OpenSteamTool
+<div align="center">
+  <img src="docs/logo-animated.svg" width="180" alt="OpenSteamTool logo">
 
-![cpp](https://img.shields.io/badge/cpp-20%2B-green?logo=cplusplus)
-![CMake](https://img.shields.io/badge/CMake-3.20%2B-green?logo=cmake)
-![OnlyWindows](https://img.shields.io/badge/windows%20only-red?style=for-the-badge)
+  <h1>OpenSteamTool</h1>
 
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/OpenSteam001/OpenSteamTool)
+  <p>
+    <strong>Open-Source Steam Unlock Tool</strong>
+  </p>
 
-OpenSteamTool is a Windows DLL project built with CMake.
+  <p>
+    <img src="https://img.shields.io/badge/C%2B%2B-20%2B-2ea44f?logo=cplusplus&logoColor=white" alt="C++ 20+">
+    <img src="https://img.shields.io/badge/CMake-3.20%2B-2ea44f?logo=cmake&logoColor=white" alt="CMake 3.20+">
+    <img src="https://img.shields.io/badge/Windows-only-d73a49?logo=windows&logoColor=white" alt="Windows only">
+    <a href="https://deepwiki.com/OpenSteam001/OpenSteamTool">
+      <img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki">
+    </a>
+  </p>
+
+  <p>
+    <a href="README.md">
+      <img src="https://flagcdn.com/w40/us.png" width="22" alt="United States flag">
+      English
+    </a>
+    &nbsp;|&nbsp;
+    <a href="README_ES.md">
+      <img src="https://flagcdn.com/w40/es.png" width="22" alt="Spain flag">
+      Español
+    </a>
+  </p>
+</div>
 
 ## Feature
 
@@ -14,20 +35,54 @@ OpenSteamTool is a Windows DLL project built with CMake.
 - Unlock an unlimited number of unowned games.
 - Unlock all DLCs for unowned games.
 - Support auto load depot decryption keys from Lua config.
-- Support auto manifest download via `steamrun` / `wudrm` upstream APIs(default is `wudrm`), or a custom Lua endpoint (see [Manifest via Lua](#manifest-via-lua)).
+- Support auto manifest download via `opensteamtool` / `steamrun` / `wudrm` upstream APIs (default is `opensteamtool`), or a custom Lua endpoint (see [Manifest via Lua](#manifest-via-lua)).
 - Support downloading protected games or DLCs that require an access token.
 - Support binding manifest to prevent specific games from being updated.
 
 ### Hot Reload
 - Adding, modifying, deleting, or overwriting `.lua` files in any watched directory automatically triggers a reload. No restart, no offline/online toggle needed.
 
+### Injection
+- Add optional game-process library injection through `[inject]` in `opensteamtool.toml`.
+- Configure `enabled`, `library_x64`, and `library_x86`; the injected library must match the target process architecture.`library_x64` and `library_x86` may be absolute paths, or relative paths resolved from the Steam root directory.
+
 ### Family Sharing and Remote Play
-- Bypass Steam Family Sharing restrictions, allowing shared games to be played without limitations.
+- Bypass Steam Family Sharing restrictions for games that have been added to the library with `addappid` in Lua. All accounts in the Steam Family that participate in sharing must use OpenSteamTool for this to work.
 
 ### Compatible with games protected by Denuvo and SteamStub
-- For AppTicket and ETicket: in `HKEY_CURRENT_USER\Software\Valve\Steam\Apps\{AppId}`, both `AppTicket` and `ETicket` are `REG_BINARY` values.
-- Use `setAppTicket(appid, "hex")` and `setETicket(appid, "hex")` in Lua config to write these values to the registry automatically.
-- SteamID priority: read `SteamID` as `REG_SZ` (numeric-only) first; if missing, parse from `AppTicket`.
+- SteamStub-only games do not require configuring `AppTicket`. OpenSteamTool can reuse Steam's local ConfigStore ticket and forge the requested AppId through a SteamDRMP off-by-four ticket parsing vulnerability, without injecting into the game process.
+- Denuvo-protected games still require explicit ticket data. OpenSteamTool stores `AppTicket` and `ETicket` through the platform credential store.
+- Use `setAppTicket(appid, "hex")` and `setETicket(appid, "hex")` in Lua config to write these values to the platform credential store automatically.
+- Denuvo verification has a 30-minute validity window. After this window expires, authorization may fail with Denuvo error code `88500005`; refresh the ticket data before retrying.
+- AppTicket priority: explicit tickets have the highest priority, including tickets configured by `setAppTicket` and existing cached `AppTicket` credential values. If no explicit AppTicket is available, OpenSteamTool falls back to the forged local ConfigStore ticket path.
+- SteamID priority: read cached `SteamID` first; if missing, parse from explicit `AppTicket`. On Windows, the credential store backend currently uses `HKCU\Software\Valve\Steam\Apps\<AppId>`. The Linux backend is not implemented yet.
+
+#### Extracting tickets with `extract_tickets`
+
+The `extract_tickets` tool dumps the `AppTicket` and `ETicket` hex strings you need for `setAppTicket` / `setETicket`. Run it on a machine where Steam is running and logged into an account that **owns** the target game.
+
+1. Build the tools (see [Build](#build)); the binary lands in `build/tools/Release/extract_tickets.exe`.
+2. Run it with the target AppId (or run it with no argument and type the AppId when prompted):
+   ```powershell
+   extract_tickets.exe 1361510
+   ```
+3. It reads the Steam install path from the registry, loads `steamclient64.dll`, and writes everything into an `<appid>/` folder next to the executable:
+   - `appticket.bin` — raw app ownership ticket (binary)
+   - `eticket.bin` — raw encrypted app ticket (binary)
+   - `tickets.txt` — plain-text summary with the hex strings:
+     ```
+     appid:1361510
+     appticket(184 bytes):14000000...
+     eticket(143 bytes):...
+     ```
+   A ticket that could not be obtained is reported as `appticket:null` / `eticket:null`.
+4. Paste the hex strings from `tickets.txt` into your Lua config:
+   ```lua
+   setAppTicket(1361510, "14000000...")
+   setETicket(1361510, "...")
+   ```
+
+> **Note:** Tickets are only valid when extracted from an account that **genuinely owns** the game.
 
 ### Stats and Achievements
 - Enable stats and achievements for unowned games.
@@ -38,10 +93,7 @@ OpenSteamTool is a Windows DLL project built with CMake.
 - Add `-onlinefix` to the Steam launch parameters to enable 480-based online play in games that use lobby matchmaking. The current limitation is that only one such game can run at a time.To revert, simply remove -onlinefix from the launch parameters — online play returns to normal on the next launch.
 
 ## Future
-- For games protected by Denuvo and SteamStub, find a safe timing to switch `GetSteamID` (see `src/Hook/Hooks_IPC.cpp#Handler_IClientUser_GetSteamID` TODO) so save files are not affected.(**Suggestions welcome — when is the earliest point after game initialization that we can safely switch the
-  SteamID without affecting save file binding?**)
 - Steam Cloud synchronization support.(This is a huge project)
-- Add Auto Denuvo Authorization Sharing for Legitimate Accounts.
 
 ## Usage
 1. Run `build.bat` from the project root to build the project.
@@ -60,9 +112,9 @@ addtoken(1361510,"2764735786934684318") -- add access token ("276473578693468431
 setManifestid(1361511,"5656605350306673283") -- pin depotid:1361511 manifest_gid:5656605350306673283, size defaults to 0
 setManifestid(1361511,"5656605350306673283", 12345678) -- same but with explicit size
 
-setAppTicket(1361510,"0100000000000000...") -- write AppTicket (REG_BINARY) to HKCU\Software\Valve\Steam\Apps\1361510\AppTicket
+setAppTicket(1361510,"0100000000000000...") -- write AppTicket to the credential store; on Windows: HKCU\Software\Valve\Steam\Apps\1361510\AppTicket
 
-setETicket(1361510,"0100000000000000...") -- write ETicket (REG_BINARY) to HKCU\Software\Valve\Steam\Apps\1361510\ETicket
+setETicket(1361510,"0100000000000000...") -- write ETicket to the credential store; on Windows: HKCU\Software\Valve\Steam\Apps\1361510\ETicket
 
 setStat(1361510, "76561197960287930") -- use the specified SteamID's achievement data for appid 1361510
 -- If not configured, default SteamID 76561198028121353 is used.
@@ -74,6 +126,7 @@ All function names are **case-insensitive**. `setAppTicket`, `setappticket`, `Se
 
 Rename `opensteamtool.example.toml` to `opensteamtool.toml` and place it in the Steam root directory (next to `steam.exe`).
 If no config file is found, built-in defaults are used — no auto-creation.
+The file is watched while Steam is running; valid changes are hot-reloaded without restarting Steam.
 
 ```toml
 [log]
@@ -81,8 +134,8 @@ If no config file is found, built-in defaults are used — no auto-creation.
 level = "info"
 
 [manifest]
-# Upstream API for depot manifest request codes.  Options: "steamrun", "wudrm"
-url = "steamrun"
+# Upstream API for depot manifest request codes.  Options: "opensteamtool", "steamrun", "wudrm"
+url = "opensteamtool"
 
 # HTTP timeouts for manifest requests (milliseconds)
 timeout_resolve_ms = 5000
@@ -96,10 +149,16 @@ timeout_recv_ms    = 10000
 [lua]
 paths = []
 
-# Optional signature-file mirror. See "Steam version compatibility" below.
-# Leave commented out for the built-in default (raw.githubusercontent.com).
-[pattern]
-# mirror = "https://cdn.jsdelivr.net/gh/OpenSteam001/steam-monitor@pattern"
+[inject]
+# Optional library injection into game processes.
+# The injected library must match the target process architecture.
+enabled = false
+# library_x64 = "OpenSteamTool.GameHook.x64.dll"
+# library_x86 = "OpenSteamTool.GameHook.x86.dll"
+
+# Optional metadata mirror. See "Steam version compatibility" below.
+[remote]
+# url_template = "https://your.server/{channel}/{component}/{sha256}.toml"
 ```
 
 ### Manifest via Lua
@@ -143,38 +202,15 @@ You can also drop a pattern TOML into the cache directory manually if you know t
 
 #### Using a different mirror
 
-For most users, the built-in **GitHub → jsDelivr** automatic fallback is enough; you do not need to touch `opensteamtool.toml` at all.
+For most users, the built-in **GitHub -> jsDelivr** fallback is enough. To use a private mirror or intranet server, configure a full URL template. A custom mirror replaces the built-in remote sources; local cache fallback remains available.
 
-If you want to force a specific source (private mirror, intranet server, or a CDN that's faster on your network than the defaults), set it explicitly in `opensteamtool.toml`. **Setting `mirror` disables the automatic GitHub→jsDelivr fallback** — only the URL you specify is tried, on the principle that an explicit user choice should win.
+The template must include `{channel}`, `{component}`, and `{sha256}`. Channels currently used are `pattern` and `ipc`.
 
 ```toml
-[pattern]
-# Default if unset:
-#   https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern
-# Examples:
-mirror = "https://cdn.jsdelivr.net/gh/OpenSteam001/steam-monitor@pattern"
-# mirror = "https://ghproxy.com/https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern"
-# mirror = "https://your.server.com/opensteamtool-patterns"
+[remote]
+url_template = "https://your.server/{channel}/{component}/{sha256}.toml"
+# url_template = "https://fast.jsdelivr.net/gh/OpenSteam001/steam-monitor@{channel}/{component}/{sha256}.toml"
 ```
-
-The full URL fetched at runtime is `<mirror>/steamclient/<sha256>.toml` and `<mirror>/steamui/<sha256>.toml`. Any HTTPS server that serves the same directory layout works. A trailing `/` is allowed but optional.
-
-Resolved URL by config (example, for the `steamui` lookup):
-
-| Config | Resulting URL |
-|---|---|
-| `[pattern]` omitted, or `mirror = ""` | `https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern/steamui/<sha>.toml` |
-| `mirror = "https://cdn.jsdelivr.net/gh/OpenSteam001/steam-monitor@pattern"` | `https://cdn.jsdelivr.net/gh/OpenSteam001/steam-monitor@pattern/steamui/<sha>.toml` |
-| `mirror = "https://your.server.com/p/"` (trailing slash) | `https://your.server.com/p/steamui/<sha>.toml` (slash stripped at parse) |
-
-**Verifying a mirror in your browser:** paste a complete URL — base + subdir + a real SHA-256 + `.toml`. The base URL alone (without the file path) will return `Invalid URL` from most CDNs, which is expected behavior, not a sign the mirror is broken. Example URLs you can paste directly:
-
-```
-https://cdn.jsdelivr.net/gh/OpenSteam001/steam-monitor@pattern/steamui/7a72275b5efc6781a964f6a8e5414ea2226c4a0a64a82e79b9e7d501dfcc3b57.toml
-https://raw.githubusercontent.com/OpenSteam001/steam-monitor/pattern/steamui/7a72275b5efc6781a964f6a8e5414ea2226c4a0a64a82e79b9e7d501dfcc3b57.toml
-```
-
-Replace the hash with a real one from [the upstream `pattern` branch](https://github.com/OpenSteam001/steam-monitor/tree/pattern/steamui). If the browser returns `200` you're good; `404` means upstream hasn't published a file for that DLL yet (open an issue), and connect/timeout errors mean the mirror itself isn't reachable from your network — pick another.
 
 ### Debug logging
 
@@ -182,18 +218,21 @@ Debug builds write per-module log files under `<Steam>/opensteamtool/`:
 
 | File | Source | Content |
 |------|--------|---------|
-| `main.log`          | General | Init, config loading, Lua parsing,Utils |
+| `main.log`          | General | Init, config loading, Lua parsing, utilities |
 | `ipc.log`           | `LOG_IPC_*` | IPC commands, InterfaceCall dispatch, spoofing |
 | `netpacket.log`     | `LOG_NETPACKET_*` | Network packet send/recv, eMsg dispatch |
-| `manifest.log`      | `LOG_MANIFEST_*` | Manifest download, `fetch_manifest_code`,manifest binding |
+| `manifest.log`      | `LOG_MANIFEST_*` | Manifest download, `fetch_manifest_code`, manifest binding |
 | `decryptionkey.log` | `LOG_DECRYPTIONKEY_*` | Depot decryption key injection |
 | `keyvalue.log`      | `LOG_KEYVALUE_*` | KeyValues patching (manifest binding) |
 | `misc.log`          | `LOG_MISC_*` | Engine pointer capture, AppId hints |
-| `winhttp.log`       | `LOG_WINHTTP_*` | HTTP requests  |
 | `achievement.log`   | `LOG_ACHIEVEMENT_*` | UserStats requests/responses, steamid spoofing |
 | `pics.log`          | `LOG_PICS_*` | PICS access token injection |
 | `package.log`       | `LOG_PACKAGE_*` | Package injection, FileWatcher events |
 | `onlinefix.log`     | `LOG_ONLINEFIX_*` | Online fix (480 AppId spoofing) |
+| `richpresence.log`  | `LOG_RICHPRESENCE_*` | Rich Presence packet construction and injection |
+| `steamui.log`       | `LOG_STEAMUI_*` | SteamUI hook diagnostics |
+| `pipe.log`          | `LOG_PIPE_*` | Pipe handshakes, process inspection, Denuvo authorization, library injection |
+| `platform.log`      | `LOG_PLATFORM_*` | Platform helper diagnostics, including remote-process operations |
 
 The log level is controlled by `[log] level` in `opensteamtool.toml`.
 

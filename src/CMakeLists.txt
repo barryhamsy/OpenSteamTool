@@ -4,6 +4,7 @@ project(OpenSteamTool VERSION 1.0.0 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
+set(OPENSTEAMTOOL_VERSION "${PROJECT_VERSION}" CACHE STRING "Version string embedded into OpenSteamTool.dll")
 
 # Allow CMAKE_MSVC_RUNTIME_LIBRARY to control runtime selection for all targets,
 # including dependencies pulled in via FetchContent.
@@ -18,13 +19,25 @@ set(CMAKE_CONFIGURATION_TYPES "Debug;Release" CACHE STRING "" FORCE)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
+
+if(NOT WIN32)
+    message(STATUS "OpenSteamTool: no targets on non-Windows platforms; skipping.")
+    return()
+endif()
+
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/OpenSteamToolBuildInfo.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/OpenSteamToolBuildInfo.h"
+    @ONLY
+)
+
 # ---------------------------------------------------------------------------
 # Dependency recipes (FetchContent-backed, cached at <repo>/.deps).
 # ---------------------------------------------------------------------------
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 set(OPENSTEAMTOOL_TOOLS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tools")
 include(Lua)
-include(Detours)
 include(Spdlog)
 include(Protobuf)
 include(Tomlplusplus)
@@ -73,25 +86,42 @@ add_custom_command(
 )
 
 # ---------------------------------------------------------------------------
-# OpenSteamTool — the hook DLL injected into Steam (always 64-bit).
+# OSTPlatform — internal static library that owns the OS-specific backends.
+# Its build is defined in its own module CMakeLists so this top-level file stays
+# focused on host-level products (the DLLs) and code generation.
 # ---------------------------------------------------------------------------
+add_subdirectory(OSTPlatform)
+
+# ---------------------------------------------------------------------------
+# Windows host artifacts: the injected hook DLL and the two loader-hijack DLLs.
+# All Windows-only by construction (PE DLL hijacking + Win32 hooking).
+# ---------------------------------------------------------------------------
+
+# OpenSteamTool — the hook DLL injected into Steam (always 64-bit).
 add_library(OpenSteamTool SHARED
     dllmain.cpp
 
     # Shared utilities
-    Utils/AppTicket.cpp
-    Utils/ByteSearch.cpp
-    Utils/PatternLoader.cpp
-    Utils/Log.cpp
-    Utils/Config.cpp
-    Utils/LuaConfig.cpp
-    Utils/VehCommon.cpp
-    Utils/WinHttp.cpp
-    Utils/FileWatcher.cpp
-    Utils/ManifestClient.cpp
-    Utils/RemoteToml.cpp
-    Utils/IPCLoader.cpp
-    Utils/SteamDiagnostics.cpp
+    Utils/Tickets/AppTicket.cpp
+    Utils/Config/Config.cpp
+    Utils/Config/ConfigFileWatcher.cpp
+    Utils/Config/LuaConfig.cpp
+    Utils/Config/LuaFileWatcher.cpp
+    Utils/HookSupport/VehCommon.cpp
+    Utils/Logging/Log.cpp
+    Utils/SteamMetadata/IPCLoader.cpp
+    Utils/SteamMetadata/ManifestClient.cpp
+    Utils/SteamMetadata/PatternLoader.cpp
+    Utils/SteamMetadata/RemoteToml.cpp
+    Utils/SteamMetadata/SteamDiagnostics.cpp
+
+    # Pipe subsystem: generic handshake registry + ProcessInspector core, plus
+    # self-contained features that own their primitives.
+    Pipe/PipeManager.cpp
+    Pipe/ProcessInspector.cpp
+    Pipe/Features/DenuvoAuth/DenuvoAuth.cpp
+    Pipe/Features/DenuvoAuth/ProtectionScan.cpp
+    Pipe/Features/Injection/Injection.cpp
 
     # Generated IPC message structs (depends on IPCMessages.steamd via add_custom_command)
     "${IPC_GEN}"
@@ -123,10 +153,8 @@ target_include_directories(OpenSteamTool PRIVATE
 )
 
 target_link_libraries(OpenSteamTool PRIVATE
+    OSTPlatform
     lua_static
-    detours
-    winhttp
-    Bcrypt
     $<$<CONFIG:Debug>:libprotobuf>
     $<$<CONFIG:Release>:libprotobuf-lite>
     tomlplusplus::tomlplusplus
@@ -137,6 +165,7 @@ target_link_libraries(OpenSteamTool PRIVATE
 target_compile_definitions(OpenSteamTool PRIVATE
     $<$<CONFIG:Debug>:OPENSTEAMTOOL_LOGGING_ENABLED>
 )
+
 
 # ---------------------------------------------------------------------------
 # dwrite.dll hijack — small loader DLL placed alongside Steam.
@@ -155,3 +184,4 @@ add_library(dinput8 SHARED
 )
 
 target_link_libraries(dinput8 PRIVATE detours)
+

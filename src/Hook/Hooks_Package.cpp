@@ -2,7 +2,8 @@
 #include "HookMacros.h"
 #include "Hooks_SteamUI.h"
 #include "dllmain.h"
-#include "Utils/VehCommon.h"
+#include "Utils/HookSupport/VehCommon.h"
+#include <unordered_set>
 
 namespace {
     RESOLVE_FUNC(CUtlMemoryGrow,               void*, CUtlVector<AppId_t>*, int);

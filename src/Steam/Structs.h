@@ -243,9 +243,9 @@ struct ExtendedMsgHdr
 struct CPipeClient {
     void*    m_pServer;         // +0
     void*    m_pClient;         // +8
-    uint32   m_hSteamPipe;      // +16
+    HSteamPipe  m_hSteamPipe;      // +16
     uint8    _pad0[12];         // +20
-    uint32   m_clientPID;       // +32
+    PID_t    m_clientPID;       // +32
     uint8    _pad1[4];          // +36
     char*    m_szProcessName;   // +40
     uint8    _pad2[80];         // +48
@@ -301,8 +301,13 @@ struct CGameID{
 	};
 };
 
+constexpr unsigned int k_unSteamAccountIDMask = 0xFFFFFFFF;
+constexpr unsigned int k_unSteamAccountInstanceMask = 0x000FFFFF;
+constexpr unsigned int k_unSteamUserDefaultInstance	= 1; // fixed instance for all individual users
+
 struct CSteamID
 {
+
 	CSteamID()
 	{
 		m_steamid.m_comp.m_unAccountID = 0;
@@ -314,6 +319,28 @@ struct CSteamID
 	CSteamID( uint64 ulSteamID )
 	{
 		SetFromUint64( ulSteamID );
+	}
+
+	//-----------------------------------------------------------------------------
+	// Purpose: Sets parameters for steam ID
+	// Input  : unAccountID -	32-bit account ID
+	//			eUniverse -		Universe this account belongs to
+	//			eAccountType -	Type of account
+	//-----------------------------------------------------------------------------
+	void Set( uint32 unAccountID, EUniverse eUniverse, EAccountType eAccountType )
+	{
+		m_steamid.m_comp.m_unAccountID = unAccountID;
+		m_steamid.m_comp.m_EUniverse = eUniverse;
+		m_steamid.m_comp.m_EAccountType = eAccountType;
+
+		if ( eAccountType == k_EAccountTypeClan || eAccountType == k_EAccountTypeGameServer )
+		{
+			m_steamid.m_comp.m_unAccountInstance = 0;
+		}
+		else
+		{
+			m_steamid.m_comp.m_unAccountInstance = k_unSteamUserDefaultInstance;
+		}
 	}
 
 	void SetFromUint64( uint64 ulSteamID )

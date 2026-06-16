@@ -4,9 +4,9 @@
 #include "Hooks_IPC_ISteamUtils.h"
 #include "HookMacros.h"
 #include "Hooks_Misc.h"
-#include "Utils/Hash.h"
-#include "Utils/IPCLoader.h"
-#include <algorithm>
+#include "Pipe/PipeManager.h"
+#include "Utils/Support/FnvHash.h"
+#include "Utils/SteamMetadata/IPCLoader.h"
 
 namespace {
 
@@ -16,10 +16,11 @@ namespace {
         return oGetPipeClient ? oGetPipeClient(pServer, hSteamPipe) : nullptr;
     }
 
+    //  Handler dispatch table
     struct ResolvedHandler {
         EIPCInterface         interfaceID;
         uint32                funcHash;
-        std::string           name;
+        std::string           name;       // "IClientUser::GetSteamID" — for logs
         uint32                fencepost;
         uint32                argc;
         IPCHandlerFn          pre;
@@ -27,12 +28,16 @@ namespace {
 
         ResolvedHandler(const IPCHandlerEntry& entry, const IPCLoader::Method& method)
             : interfaceID(method.interfaceID),
-            funcHash(method.funcHash),
-            name(std::string(entry.interfaceName) + "::" + entry.methodName),
-            fencepost(method.fencepost),
-            argc(method.argc),
-            pre(entry.pre),
-            post(entry.post) {
+              funcHash(method.funcHash),
+              name(std::string(entry.interfaceName) + "::" + entry.methodName),
+              fencepost(method.fencepost),
+              argc(method.argc),
+              pre(entry.pre),
+              post(entry.post) {}
+
+        std::string DebugString() const {
+            return std::format("{} -> hash=0x{:08X} fencepost=0x{:08X} argc={}",
+                name, funcHash, fencepost, argc);
         }
     };
     std::vector<ResolvedHandler> g_Handlers;
@@ -45,32 +50,69 @@ namespace {
     }
 
     struct IPCDispatch {
-        CPipeClient* pipe = nullptr;
+        CPipeClient*     pipe = nullptr;
         ResolvedHandler* handler = nullptr;
-        bool enabled() const { return pipe && handler; }
+
+        bool enabled() const {
+            return pipe && handler;
+        }
+
+        std::string DebugString() const {
+            return std::format("{} {}",pipe ? pipe->DebugString() : "null",
+                                handler ? handler->DebugString() : "null");
+        }
     };
 
-    static IPCDispatch ResolveDispatch(void* pServer, HSteamPipe hSteamPipe, CUtlBuffer* pRead)
+    static IPCDispatch ResolveDispatch(void* pServer,HSteamPipe hSteamPipe,CUtlBuffer* pRead)
     {
         IPCDispatch dispatch{};
         dispatch.pipe = GetPipe(pServer, hSteamPipe);
         if (!dispatch.pipe) return dispatch;
 
-        IPCMessages::IPCRequest request{ pRead };
-        if (!request.ok() || request.command() != EIPCCommand::InterfaceCall) return dispatch;
+        // We only care about InterfaceCall messages
+        IPCMessages::IPCRequest request{pRead};
+        if (!request.ok()) return dispatch;
+        if (request.command() != EIPCCommand::InterfaceCall) return dispatch;
 
-        IPCMessages::IPCInterfaceCall call{ request.body() };
+        // Ignore calls when appId is not resolved or not in Lua config
+        if (!LuaConfig::HasDepot(Hooks_Misc::ResolveAppId())) return dispatch;
+
+        // Parse out the interface call header to find the handler
+        IPCMessages::IPCInterfaceCall call{request.body()};
         if (!call.ok()) return dispatch;
 
+        // Lookup handler by interface ID + method hash
         dispatch.handler = FindHandler(call.interfaceID(), call.funcHash());
+        if (!dispatch.handler) return dispatch;
+
+        LOG_IPC_TRACE("Resolved IPC handler: {}", dispatch.DebugString());
         return dispatch;
     }
 
-    HOOK_FUNC(IPCProcessMessage, bool, void* pServer, HSteamPipe hSteamPipe,
-        CUtlBuffer* pRead, CUtlBuffer* pWrite)
+    static void HandleHandshake(void* pServer, HSteamPipe hSteamPipe,CUtlBuffer* pRead)
     {
+        IPCMessages::IPCRequest request{pRead};
+        if (!request.ok()|| request.command() != EIPCCommand::Handshake) return;
+        IPCMessages::IPCHandshakeReq handshake{request.body()};
+        if(!handshake.ok()) return;
+
+        CPipeClient* pipe = GetPipe(pServer, hSteamPipe);
+        if (!pipe) return;
+        // set client PID 
+        pipe->m_clientPID = handshake.pid();
+
+        LOG_IPC_DEBUG("Received handshake from {},{}", pipe->DebugString(), handshake.DebugString());
+        PipeManager::OnHandshake(pipe);
+    }
+
+    HOOK_FUNC(IPCProcessMessage, bool,void* pServer, HSteamPipe hSteamPipe,
+              CUtlBuffer* pRead, CUtlBuffer* pWrite)
+    {
+        // Handle handshake messages (PipeManager bookkeeping)
+        HandleHandshake(pServer, hSteamPipe, pRead);
+
         bool handled = false;
-        bool result = false;
+        bool result  = false;
 
         // Determine who is talking to Steam: The Game (> 0) or The UI (0)
         AppId_t pipeAppId = Hooks_Misc::GetAppIDForCurrentPipeWrap();
@@ -83,42 +125,31 @@ namespace {
             // 1. THE GAME PIPE: Capcom Save Fix
             //
             // Two response shapes need different sanitization:
-            //   - 2-byte response (prefix 0x0B + 1 bool):  IsCloudEnabledForApp,
-            //     IsCloudEnabledThisApp, etc.  Write 0 so the game sees cloud
-            //     as DISABLED and falls back to local saves cleanly.  If we
-            //     leave this untouched the game sees Steam's account-level
-            //     value (usually true), then asks cloud for save data, finds
-            //     nothing for the spoofed AppID, and decides to start fresh —
-            //     classic Capcom "save wiped every launch" symptom.
-            //   - 5-byte response (prefix 0x0B + 1 EResult): SyncFiles,
-            //     BeginFileWriteBatch, etc.  Write 1 (k_EResultOK) so the
-            //     game thinks the sync succeeded and proceeds without panic.
+            //   - 2-byte  (prefix 0x0B + 1 bool):  IsCloudEnabledForApp etc.
+            //     Write 0 so the game sees cloud as DISABLED and falls back
+            //     to local saves.  Without this, Capcom games start fresh
+            //     every launch ("save wiped" symptom).
+            //   - 5-byte  (prefix 0x0B + 1 EResult): SyncFiles etc.
+            //     Write 1 (k_EResultOK) so the game thinks sync succeeded.
             //
-            // File ops (>18 bytes carry filename + payload) pass through
-            // untouched so the game's own FileWrite / FileRead calls still
-            // hit Steam's local UFS layer for actual save persistence.
+            // File ops (>18 bytes) pass through untouched so FileWrite /
+            // FileRead calls still reach Steam's local UFS layer.
             // ════════════════════════════════════════════════════════════════
             if (pipeAppId > 0 && call.ok() && call.interfaceID() == EIPCInterface::IClientRemoteStorage) {
                 if (pRead->TellPut() >= 14) {
                     AppId_t targetAppId = *reinterpret_cast<const AppId_t*>(pRead->Base() + 10);
-
                     if (LuaConfig::HasDepot(targetAppId)) {
                         const int32_t reqSize = pRead->TellPut();
-
-                        // Let file ops (>18 bytes) pass so Capcom games can write saves!
                         if (reqSize <= 18) {
-                            result = oIPCProcessMessage(pServer, hSteamPipe, pRead, pWrite);
+                            result  = oIPCProcessMessage(pServer, hSteamPipe, pRead, pWrite);
                             handled = true;
-
                             if (result && pWrite->TellPut() >= 2) {
                                 uint8* resBase = pWrite->Base();
                                 if (resBase[0] == 0x0B) {
-                                    if (pWrite->TellPut() == 2) {
-                                        resBase[1] = 0;                                    // bool → false (cloud disabled)
-                                    }
-                                    else if (pWrite->TellPut() == 5) {
-                                        *reinterpret_cast<uint32_t*>(resBase + 1) = 1;     // EResult → k_EResultOK
-                                    }
+                                    if (pWrite->TellPut() == 2)
+                                        resBase[1] = 0;                                   // bool → false
+                                    else if (pWrite->TellPut() == 5)
+                                        *reinterpret_cast<uint32_t*>(resBase + 1) = 1;    // EResult → OK
                                 }
                             }
                         }
@@ -127,40 +158,32 @@ namespace {
             }
 
             // ════════════════════════════════════════════════════════════════
-            // 2. THE UI PIPE: Safe Visual Scrubber (Zero Jumping Errors!)
+            // 2. THE UI PIPE: Safe Visual Scrubber
+            //
+            // Strip the Cloud flags from AppState fields in IClientAppManager
+            // responses so the library view never renders cloud-sync badges
+            // for spoofed games (which would jump / spin / show errors).
             // ════════════════════════════════════════════════════════════════
             else if (pipeAppId == 0 && call.ok() && call.interfaceID() == EIPCInterface::IClientAppManager) {
-                result = oIPCProcessMessage(pServer, hSteamPipe, pRead, pWrite);
+                result  = oIPCProcessMessage(pServer, hSteamPipe, pRead, pWrite);
                 handled = true;
 
                 if (result && pWrite && pWrite->TellPut() >= 9) {
                     uint8* resBase = pWrite->Base();
-                    if (resBase[0] == 0x0B) { // Valid IPC Response
-                        uint8* data = resBase + 1;
-                        int dataLen = pWrite->TellPut() - 1;
+                    if (resBase[0] == 0x0B) {
+                        uint8* data   = resBase + 1;
+                        int    dataLen = pWrite->TellPut() - 1;
 
                         for (int i = 0; i <= dataLen - 8; i++) {
                             AppId_t id = *reinterpret_cast<AppId_t*>(data + i);
-
-                            // Cover every spoofed AppID, not just the running one.
-                            // At library-view time no game is running so ResolveAppId()=0
-                            // and the old filter missed them all.
-                            //
-                            // Safety bounds: Steam AppIDs are 1,000–3,000,000ish.
-                            // Values below 1000 or above 0x02000000 are almost certainly
-                            // field sizes, pointers, or flags — not AppIDs.  The HasDepot
-                            // lookup filters to our exact spoofed list.
+                            // Steam AppIDs are 1 000 – ~3 000 000; HasDepot filters to ours
                             if (id >= 480 && id < 0x02000000 && LuaConfig::HasDepot(id)) {
                                 const uint32_t k_CloudMask = 0x001C0000;
-
-                                // Check multiple offsets — different Steam versions pack
-                                // AppState flags at different positions after the AppID.
                                 for (int offset = 4; offset <= 24; offset += 4) {
                                     if (i + offset + 4 <= dataLen) {
                                         uint32_t* state = reinterpret_cast<uint32_t*>(data + i + offset);
-                                        if ((*state & k_CloudMask) != 0 && *state < 0x02000000) {
+                                        if ((*state & k_CloudMask) != 0 && *state < 0x02000000)
                                             *state &= ~k_CloudMask;
-                                        }
                                     }
                                 }
                             }
@@ -170,27 +193,38 @@ namespace {
             }
         }
 
-        const IPCDispatch dispatch = ResolveDispatch(pServer, hSteamPipe, pRead);
+        // Early return if one of the custom handlers above processed the message
+        if (handled) return result;
 
-        if (!handled) {
-            if (dispatch.enabled() && dispatch.handler->pre) dispatch.handler->pre(dispatch.pipe, pRead, pWrite);
-            result = oIPCProcessMessage(pServer, hSteamPipe, pRead, pWrite);
-        }
+        // ── Generic dispatch for registered IPC handlers ──────────────────
+        IPCDispatch dispatch = ResolveDispatch(pServer, hSteamPipe, pRead);
+        if (!dispatch.enabled()) return oIPCProcessMessage(pServer, hSteamPipe, pRead, pWrite);
 
-        if (!handled && dispatch.enabled() && dispatch.handler->post) {
+        if (dispatch.handler->pre)
+            dispatch.handler->pre(dispatch.pipe, pRead, pWrite);
+
+        result = oIPCProcessMessage(pServer, hSteamPipe, pRead, pWrite);
+
+        if (result && dispatch.handler->post)
             dispatch.handler->post(dispatch.pipe, pRead, pWrite);
-        }
 
         return result;
     }
 
 } // namespace
 
+
 namespace Hooks_IPC {
+
     void Install() {
         RESOLVE_C(GetPipeClient);
+
+        // Each module registers a static array. Hash lookup against the
+        // IPCLoader metadata happens inside RegisterHandlers.
         Hooks_IPC_ISteamUser::Register();
         Hooks_IPC_ISteamUtils::Register();
+
+        LOG_IPC_INFO("Hooks_IPC: {} handlers registered", g_Handlers.size());
 
         HOOK_BEGIN();
         INSTALL_HOOK_C(IPCProcessMessage);
@@ -206,8 +240,13 @@ namespace Hooks_IPC {
     void RegisterHandlers(std::span<const IPCHandlerEntry> entries) {
         for (const auto& e : entries) {
             const auto* m = IPCLoader::Find(e.interfaceName, e.methodName);
-            if (!m) continue;
-            g_Handlers.emplace_back(e, *m);
+            if (!m) {
+                LOG_IPC_WARN("[Handler Disabled] no IPC spec for {}",e.DebugString());
+                continue;
+            }
+            auto& handler = g_Handlers.emplace_back(e,*m);
+            LOG_IPC_DEBUG("Hooks_IPC: resolved {}", handler.DebugString());
         }
     }
+
 }
