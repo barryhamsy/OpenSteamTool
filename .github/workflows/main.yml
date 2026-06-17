@@ -1,4 +1,5 @@
 name: Build
+run-name: ${{ github.event.inputs.version }} Build
 
 on:
   workflow_dispatch:
@@ -19,7 +20,7 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure
-        run: cmake -S src -B build -G "Ninja Multi-Config"
+        run: cmake -S src -B build -G "Ninja Multi-Config" -DOPENSTEAMTOOL_VERSION="${{ github.event.inputs.version }}"
 
       - name: Build Release
         run: cmake --build build --config Release

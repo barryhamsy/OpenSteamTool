@@ -17,8 +17,8 @@ namespace {
 
     // ── VEH-captured functions (one-shot int3) ───────────────────────────────
     // On int3 hit, ctx->Rcx is stored to the named output variable.
-    CAPTURE_THIS_FUNC(GetAppIDForCurrentPipe, AppId_t,      g_steamEngine,    void*);
-    CAPTURE_THIS_FUNC(GetAppDataFromAppInfo,  int64,        g_pCAppInfoCache, void*, AppId_t, const char*, uint8*, int32);
+    CAPTURE_THIS_FUNC(GetAppIDForCurrentPipe, AppId_t, g_steamEngine, void*);
+    CAPTURE_THIS_FUNC(GetAppDataFromAppInfo, int64, g_pCAppInfoCache, void*, AppId_t, const char*, uint8*, int32);
 
     // Assumes one game at a time.  Set by SpawnProcess VEH when -onlinefix
     // is detected; cleared when a non-onlinefix game launches.
@@ -48,7 +48,7 @@ namespace {
                 std::string line;
                 while (std::getline(file, line)) {
                     if (line.find("\"WantsOfflineMode\"") != std::string::npos
-                     && line.find("\"1\"") != std::string::npos) return true;
+                        && line.find("\"1\"") != std::string::npos) return true;
                 }
             }
         }
@@ -67,7 +67,8 @@ namespace {
             const wchar_t* localAppData = nullptr;
             if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppDataBuf, MAX_PATH) > 0) {
                 localAppData = localAppDataBuf;
-            } else {
+            }
+            else {
                 wchar_t* shellPath = nullptr;
                 if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &shellPath))) {
                     wcsncpy_s(localAppDataBuf, shellPath, MAX_PATH - 1);
@@ -166,7 +167,7 @@ namespace {
                 return false;
             }
             auto paths = DiscoverManifestPaths(appId);
-            auto body  = BuildBody(appId, paths);
+            auto body = BuildBody(appId, paths);
             LOG_MISC_INFO("CloudSync: /pull AppId={} port={}", appId, port);
             bool ok = DoPost(port, L"/cloudsync/pull", body, 10000);
             if (!ok) LOG_MISC_WARN("CloudSync: /pull failed (companion down or timeout)");
@@ -177,7 +178,7 @@ namespace {
             uint16_t port = ReadAdvertisedPort();
             if (port == 0) return;
             auto paths = DiscoverManifestPaths(appId);
-            auto body  = BuildBody(appId, paths);
+            auto body = BuildBody(appId, paths);
             LOG_MISC_INFO("CloudSync: /push AppId={} port={}", appId, port);
             DoPost(port, L"/cloudsync/push", body, 5000);
         }
@@ -230,12 +231,20 @@ namespace {
             pGameID->SetAppID(kOnlineFixAppId);
             watchAppId = kOnlineFixAppId;
             LOG_MISC_INFO("SpawnProcess: appid {} -> {}, cmd=\"{}\"", appId, kOnlineFixAppId, cmdLine);
-        } else {
+        }
+        else {
             g_OnlineFixRealAppId = 0;
         }
 
-        // Pull saves synchronously before game reads them; push on exit.
         if (LuaConfig::HasDepot(appId)) {
+            // Pre-warm the name cache NOW — before CMsgClientGamesPlayed fires.
+            // GetAppDataFromAppInfo capture may not be ready yet (returns ""),
+            // but if it is ready the result is stored in g_GameNameCache so
+            // the dual-broadcast clone in Hooks_NetPacket_OnlineFix::HandleSend
+            // always gets the real name on the first GamesPlayed packet.
+            Hooks_Misc::GetGameNameByAppID(appId);
+
+            // Pull saves synchronously before game reads them; push on exit.
             CloudSync::TriggerPull(appId);
             std::thread(CloudSync::WatchExitAndPush, watchAppId, appId).detach();
         }
@@ -246,10 +255,10 @@ namespace {
     // compute EnableConfiguratorSupport and the SDL_* env vars.
     // With 480 the spawned game inherits Spacewar's Steam Input
     // opt-in and gameoverlayrenderer hijacks the XInput stream.
-    HOOK_FUNC(OptedInMask, int64,void* pThis, AppId_t appId)
+    HOOK_FUNC(OptedInMask, int64, void* pThis, AppId_t appId)
     {
         if (appId == kOnlineFixAppId && g_OnlineFixRealAppId) {
-            LOG_MISC_INFO("OptedInMask: appid {} -> {}",appId, g_OnlineFixRealAppId);
+            LOG_MISC_INFO("OptedInMask: appid {} -> {}", appId, g_OnlineFixRealAppId);
             appId = g_OnlineFixRealAppId;
         }
         return oOptedInMask(pThis, appId);
@@ -261,20 +270,20 @@ namespace {
     // selection.  pCGameID drives SteamGameId / SteamAppId; leave it
     // at 480 so the in-game ownership bypass holds.
     HOOK_FUNC(BuildSpawnEnvBlock, int64,
-              void* pThis, CGameID* pCGameID, void* a3, void* env,
-              CGameID* pOverlayCGameID, void* a6, int a7,
-              void* a8, void* a9, unsigned int a10, char a11)
+        void* pThis, CGameID* pCGameID, void* a3, void* env,
+        CGameID* pOverlayCGameID, void* a6, int a7,
+        void* a8, void* a9, unsigned int a10, char a11)
     {
         if (g_OnlineFixRealAppId && pOverlayCGameID
-            && pOverlayCGameID->AppID(true) == kOnlineFixAppId) 
+            && pOverlayCGameID->AppID(true) == kOnlineFixAppId)
         {
             LOG_MISC_INFO("BuildSpawnEnvBlock: SetAppID in OverlayCGameID {} -> {}",
-                          pOverlayCGameID->AppID(true), g_OnlineFixRealAppId);
+                pOverlayCGameID->AppID(true), g_OnlineFixRealAppId);
             pOverlayCGameID->SetAppID(g_OnlineFixRealAppId);
         }
         return oBuildSpawnEnvBlock(pThis, pCGameID, a3, env,
-                                    pOverlayCGameID, a6, a7,
-                                    a8, a9, a10, a11);
+            pOverlayCGameID, a6, a7,
+            a8, a9, a10, a11);
     }
 
     // CAppInfoCache::GetOrAddAppData
@@ -287,7 +296,7 @@ namespace {
     // marked as a known-unknown id by the PICS path. For injected ids that
     // still have placeholder appinfo, set skip_flag so Steam treats them like
     // PICS unknown_appids instead of keeping the license update pending.
-    HOOK_FUNC(GetOrAddAppData,CAppData*,void* pCache, AppId_t appId,bool bCreate)
+    HOOK_FUNC(GetOrAddAppData, CAppData*, void* pCache, AppId_t appId, bool bCreate)
     {
         CAppData* pData = oGetOrAddAppData(pCache, appId, bCreate);
         // Only active in offline mode — online, PICS resolves app info normally.
@@ -359,9 +368,9 @@ namespace {
             while (std::getline(f, line)) {
                 auto p = line.find("\"path\"");
                 if (p == std::string::npos) continue;
-                auto q1 = line.find('"', p+6), q2 = line.find('"', q1+1);
-                auto q3 = line.find('"', q2+1), q4 = line.find('"', q3+1);
-                if (q4 != std::string::npos) libs.emplace_back(line.substr(q3+1, q4-q3-1));
+                auto q1 = line.find('"', p + 6), q2 = line.find('"', q1 + 1);
+                auto q3 = line.find('"', q2 + 1), q4 = line.find('"', q3 + 1);
+                if (q4 != std::string::npos) libs.emplace_back(line.substr(q3 + 1, q4 - q3 - 1));
             }
             for (auto& lib : libs) {
                 std::string acf = lib + "/steamapps/appmanifest_" + std::to_string(appId) + ".acf";
@@ -371,10 +380,10 @@ namespace {
                 while (std::getline(af, l)) {
                     auto p = l.find("\"installdir\"");
                     if (p == std::string::npos) continue;
-                    auto q1 = l.find('"', p+12), q2 = l.find('"', q1+1);
-                    auto q3 = l.find('"', q2+1), q4 = l.find('"', q3+1);
+                    auto q1 = l.find('"', p + 12), q2 = l.find('"', q1 + 1);
+                    auto q3 = l.find('"', q2 + 1), q4 = l.find('"', q3 + 1);
                     if (q4 != std::string::npos)
-                        return lib + "/steamapps/common/" + l.substr(q3+1, q4-q3-1);
+                        return lib + "/steamapps/common/" + l.substr(q3 + 1, q4 - q3 - 1);
                 }
             }
             return "";
@@ -386,7 +395,7 @@ namespace {
                 std::string base = "ufs/savefiles/" + std::to_string(i);
                 std::string root = ReadAppInfoString(appId, (base + "/root").c_str());
                 if (root.empty()) break;
-                std::string sub   = ReadAppInfoString(appId, (base + "/path").c_str());
+                std::string sub = ReadAppInfoString(appId, (base + "/path").c_str());
                 std::string platf = ReadAppInfoString(appId, (base + "/platforms/0").c_str());
                 if (!platf.empty()) {
                     bool ok = false;
@@ -469,25 +478,26 @@ namespace Hooks_Misc {
         auto appid = oGetAppIDForCurrentPipe(g_steamEngine);
         if (!appid) {
             LOG_MISC_TRACE("GetAppIDForCurrentPipeWrap: AppId=0(Not GamePipe)");
-        } else {
+        }
+        else {
             LOG_MISC_TRACE("GetAppIDForCurrentPipeWrap: AppId={}", appid);
         }
         return appid;
     }
 
-    
+
     AppId_t ResolveAppId() {
         if (g_OnlineFixRealAppId) return g_OnlineFixRealAppId;
         return GetAppIDForCurrentPipeWrap();
     }
-    
-    bool EnsureBufferCapacity(CUtlBuffer* pWrite, uint32 newCapacity,bool updatePut)
+
+    bool EnsureBufferCapacity(CUtlBuffer* pWrite, uint32 newCapacity, bool updatePut)
     {
         if (oCUtlBufferEnsureCapacity) {
             LOG_MISC_DEBUG("Before ensuring CUtlBuffer capacity: {}", pWrite->DebugString());
             oCUtlBufferEnsureCapacity(pWrite, newCapacity);
             LOG_MISC_DEBUG("After ensuring CUtlBuffer capacity: {}", pWrite->DebugString());
-            if(updatePut) pWrite->m_Put = newCapacity;
+            if (updatePut) pWrite->m_Put = newCapacity;
             return true;
         }
         LOG_MISC_WARN("EnsureBufferCapacity: oCUtlBufferEnsureCapacity not resolved");
