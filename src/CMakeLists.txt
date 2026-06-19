@@ -168,20 +168,16 @@ target_compile_definitions(OpenSteamTool PRIVATE
 
 
 # ---------------------------------------------------------------------------
-# dwrite.dll hijack — small loader DLL placed alongside Steam.
+# dwmapi.dll hijack — small loader DLL placed alongside Steam.
 # ---------------------------------------------------------------------------
-add_library(dwrite SHARED
-    dwrite/dwrite.cpp
-    dwrite/dwrite.def
+add_library(dwmapi SHARED
+    dwmapi/dwmapi.cpp
 )
 
 # ---------------------------------------------------------------------------
-# dinput8.dll hijack — secondary loader DLL placed alongside Steam.
+# xinput1_4.dll hijack — secondary loader DLL placed alongside Steam.
 # ---------------------------------------------------------------------------
-add_library(dinput8 SHARED
-    xinput1_4/dinput8.cpp
-    xinput1_4/dinput8.def
+add_library(xinput1_4 SHARED
+    xinput1_4/xinput1_4.cpp
+    xinput1_4/xinput1_4.def
 )
-
-target_link_libraries(dinput8 PRIVATE detours)
-
